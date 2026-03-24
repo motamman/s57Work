@@ -1,1 +1,6 @@
-data/
+data/zips/*
+data/enc/*
+data/geojson/*
+data/tiles/*
+!data/*/.gitkeep
+data/merged/*
