@@ -524,7 +524,7 @@ def run_tippecanoe_for_source(
                   f"({final.stat().st_size / 1048576:.1f} MB), skipping")
             return (z, final)
 
-        tmp = tile_dir / f".tmp-{stem}-z{z}"
+        tmp = (tile_dir / f".tmp-{stem}-z{z}").resolve()
         tmp.mkdir(exist_ok=True)
 
         print(f"  [{stem}] z{z}: running...")
