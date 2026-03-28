@@ -8,15 +8,10 @@ on:
         description: 'Comma-separated build names (leave empty to use active list from enc-sources.yaml)'
         required: false
         default: ''
-      reuse_geojson:
-        description: 'Reuse cached GeoJSON from a previous run (skip GDAL step)'
-        type: boolean
-        required: false
-        default: false
 
-  # Uncomment to run on a schedule (e.g., weekly on Sunday at 2am UTC)
-  # schedule:
-  #   - cron: '0 2 * * 0'
+  # Monthly rebuild on the 1st at 2am UTC (sailing season: Apr-Nov)
+  schedule:
+    - cron: '0 2 1 4-11 *'
 
 jobs:
   # ── Step 1: Read the config and produce a build matrix ──────────────
@@ -52,9 +47,12 @@ jobs:
                   print(f"WARNING: build '{name}' not found in enc-sources.yaml, skipping")
                   continue
               b = builds[name]
+              # Output name derived from first source: 01CGD_ENCs.zip -> 01CGD_ENCs.mbtiles
+              first_source = b["sources"][0]
+              output = first_source.rsplit(".", 1)[0] + ".mbtiles"
               matrix.append({
                   "name": name,
-                  "output": b["output"],
+                  "output": output,
                   "mode": b.get("mode", "by-band"),
                   "sources": [f"{base_url}/{s}" for s in b["sources"]],
                   "source_filenames": b["sources"],
@@ -96,25 +94,6 @@ jobs:
           tile-join --version
           ogr2ogr --version
 
-      # ── GeoJSON cache ────────────────────────────────────────────────
-      - name: Restore cached GeoJSON
-        if: inputs.reuse_geojson == true
-        id: geojson-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: data/geojson
-          key: geojson-${{ matrix.build.name }}
-
-      - name: GeoJSON cache status
-        run: |
-          if [ "${{ steps.geojson-cache.outputs.cache-hit }}" = "true" ]; then
-            count=$(find data/geojson -name '*.geojson' 2>/dev/null | wc -l)
-            echo "Restored $count cached GeoJSON files — GDAL step will be skipped"
-          else
-            echo "No cached GeoJSON — full GDAL conversion will run"
-          fi
-
-      # ── Download and build ───────────────────────────────────────────
       - name: Download ENC sources
         run: |
           mkdir -p downloads
@@ -141,15 +120,6 @@ jobs:
         run: |
           ls -lh "data/tiles/${{ matrix.build.output }}"
 
-      # ── Save GeoJSON cache (always, so next run can reuse) ───────────
-      - name: Save GeoJSON to cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data/geojson
-          key: geojson-${{ matrix.build.name }}-${{ github.run_id }}
-
-      # ── Upload final tiles ───────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -157,7 +127,7 @@ jobs:
           path: data/tiles/${{ matrix.build.output }}
           retention-days: 7
 
-  # ── Step 3: Create a GitHub Release with all built tiles ────────────
+  # ── Step 3: Create release, archive previous, prune old ─────────────
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -170,21 +140,48 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Create release
+      - name: Archive previous release, create new one, prune old
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="charts-$(date +%Y%m%d-%H%M%S)"
-          echo "Creating release: $TAG"
+          DATE=$(date +%Y%m%d-%H%M%S)
 
-          # Collect all mbtiles files
+          # ── Archive the current "latest" release ──
+          latest_tag=$(gh release list --limit 1 --json tagName,name \
+            --jq '.[] | select(.name == "ENC Charts") | .tagName' 2>/dev/null || true)
+          if [ -n "$latest_tag" ]; then
+            echo "Archiving previous release: $latest_tag"
+            gh release edit "$latest_tag" \
+              --title "ENC Charts ($latest_tag)" \
+              --prerelease
+          fi
+
+          # ── Create the new release (always the same tag: "latest") ──
+          # Delete the tag if it exists so we can reuse it
+          gh release delete "latest" --yes --cleanup-tag 2>/dev/null || true
+
           files=$(find artifacts/ -name "*.mbtiles" -type f)
-          echo "Files to upload:"
+          echo "Creating release with files:"
           ls -lh $files
 
-          # Create release with all files attached
-          gh release create "$TAG" \
-            --title "ENC Charts $TAG" \
-            --notes "Automated ENC chart build from NOAA S-57 data." \
+          gh release create "latest" \
+            --title "ENC Charts" \
+            --notes "Automated ENC chart build from NOAA S-57 data. Built $DATE." \
+            --latest \
             $files
+
+          # ── Prune old archives (keep only 2 previous) ──
+          archived=$(gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '[.[] | select(.isPrerelease)] | reverse | .[].tagName')
+
+          count=0
+          for old_tag in $archived; do
+            count=$((count + 1))
+            if [ $count -gt 2 ]; then
+              echo "Deleting old archive: $old_tag"
+              gh release delete "$old_tag" --yes --cleanup-tag
+            fi
+          done
+
+          echo "Done. Current + 2 archived releases retained."

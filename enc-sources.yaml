@@ -1,6 +1,7 @@
 # enc-sources.yaml — ENC chart build definitions for GitHub Actions
 #
 # All ZIPs are downloaded from: {base_url}/{filename}
+# Output filename is derived from the source: CT_ENCs.zip -> CT_ENCs.mbtiles
 # Edit "active" to control which builds run.
 
 base_url: https://charts.noaa.gov/ENCs
@@ -11,63 +12,54 @@ builds:
 
   # District 1: New England (ME, NH, MA, RI, CT, eastern NY)
   01cgd:
-    output: 01cgd-new-england.mbtiles
     mode: by-band
     sources:
       - 01CGD_ENCs.zip
 
   # District 5: Mid-Atlantic (NJ, PA, DE, MD, VA, DC, NC)
   05cgd:
-    output: 05cgd-mid-atlantic.mbtiles
     mode: by-band
     sources:
       - 05CGD_ENCs.zip
 
   # District 7: Southeast (SC, GA, FL east coast, PR, USVI)
   07cgd:
-    output: 07cgd-southeast.mbtiles
     mode: by-band
     sources:
       - 07CGD_ENCs.zip
 
   # District 8: Gulf Coast (FL west coast, AL, MS, LA, TX)
   08cgd:
-    output: 08cgd-gulf.mbtiles
     mode: by-band
     sources:
       - 08CGD_ENCs.zip
 
   # District 9: Great Lakes (OH, MI, IN, IL, WI, MN, western NY, northern PA)
   09cgd:
-    output: 09cgd-great-lakes.mbtiles
     mode: by-band
     sources:
       - 09CGD_ENCs.zip
 
   # District 11: Southern California
   11cgd:
-    output: 11cgd-socal.mbtiles
     mode: by-band
     sources:
       - 11CGD_ENCs.zip
 
   # District 13: Pacific Northwest (OR, WA)
   13cgd:
-    output: 13cgd-pacific-nw.mbtiles
     mode: by-band
     sources:
       - 13CGD_ENCs.zip
 
   # District 14: Hawaii & Pacific Islands
   14cgd:
-    output: 14cgd-hawaii-pacific.mbtiles
     mode: by-band
     sources:
       - 14CGD_ENCs.zip
 
   # District 17: Alaska
   17cgd:
-    output: 17cgd-alaska.mbtiles
     mode: by-band
     sources:
       - 17CGD_ENCs.zip
@@ -76,192 +68,161 @@ builds:
 
   # New England
   me:
-    output: me-maine.mbtiles
     mode: by-band
     sources:
       - ME_ENCs.zip
 
   nh:
-    output: nh-new-hampshire.mbtiles
     mode: by-band
     sources:
       - NH_ENCs.zip
 
   ma:
-    output: ma-massachusetts.mbtiles
     mode: by-band
     sources:
       - MA_ENCs.zip
 
   ri:
-    output: ri-rhode-island.mbtiles
     mode: by-band
     sources:
       - RI_ENCs.zip
 
   ct:
-    output: ct-connecticut.mbtiles
     mode: by-band
     sources:
       - CT_ENCs.zip
 
   ny:
-    output: ny-new-york.mbtiles
     mode: by-band
     sources:
       - NY_ENCs.zip
 
   # Mid-Atlantic
   nj:
-    output: nj-new-jersey.mbtiles
     mode: by-band
     sources:
       - NJ_ENCs.zip
 
   pa:
-    output: pa-pennsylvania.mbtiles
     mode: by-band
     sources:
       - PA_ENCs.zip
 
   de:
-    output: de-delaware.mbtiles
     mode: by-band
     sources:
       - DE_ENCs.zip
 
   md:
-    output: md-maryland.mbtiles
     mode: by-band
     sources:
       - MD_ENCs.zip
 
   va:
-    output: va-virginia.mbtiles
     mode: by-band
     sources:
       - VA_ENCs.zip
 
   nc:
-    output: nc-north-carolina.mbtiles
     mode: by-band
     sources:
       - NC_ENCs.zip
 
   # Southeast
   sc:
-    output: sc-south-carolina.mbtiles
     mode: by-band
     sources:
       - SC_ENCs.zip
 
   ga:
-    output: ga-georgia.mbtiles
     mode: by-band
     sources:
       - GA_ENCs.zip
 
   fl:
-    output: fl-florida.mbtiles
     mode: by-band
     sources:
       - FL_ENCs.zip
 
   pr:
-    output: pr-puerto-rico.mbtiles
     mode: by-band
     sources:
       - PR_ENCs.zip
 
   # Gulf Coast
   al:
-    output: al-alabama.mbtiles
     mode: by-band
     sources:
       - AL_ENCs.zip
 
   ms:
-    output: ms-mississippi.mbtiles
     mode: by-band
     sources:
       - MS_ENCs.zip
 
   la:
-    output: la-louisiana.mbtiles
     mode: by-band
     sources:
       - LA_ENCs.zip
 
   tx:
-    output: tx-texas.mbtiles
     mode: by-band
     sources:
       - TX_ENCs.zip
 
   # Great Lakes
   oh:
-    output: oh-ohio.mbtiles
     mode: by-band
     sources:
       - OH_ENCs.zip
 
   mi:
-    output: mi-michigan.mbtiles
     mode: by-band
     sources:
       - MI_ENCs.zip
 
   in:
-    output: in-indiana.mbtiles
     mode: by-band
     sources:
       - IN_ENCs.zip
 
   il:
-    output: il-illinois.mbtiles
     mode: by-band
     sources:
       - IL_ENCs.zip
 
   wi:
-    output: wi-wisconsin.mbtiles
     mode: by-band
     sources:
       - WI_ENCs.zip
 
   mn:
-    output: mn-minnesota.mbtiles
     mode: by-band
     sources:
       - MN_ENCs.zip
 
   # Pacific
   ca:
-    output: ca-california.mbtiles
     mode: by-band
     sources:
       - CA_ENCs.zip
 
   or:
-    output: or-oregon.mbtiles
     mode: by-band
     sources:
       - OR_ENCs.zip
 
   wa:
-    output: wa-washington.mbtiles
     mode: by-band
     sources:
       - WA_ENCs.zip
 
   hi:
-    output: hi-hawaii.mbtiles
     mode: by-band
     sources:
       - HI_ENCs.zip
 
   ak:
-    output: ak-alaska.mbtiles
     mode: by-band
     sources:
       - AK_ENCs.zip
