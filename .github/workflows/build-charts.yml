@@ -91,7 +91,7 @@ jobs:
       - name: Verify tools
         run: |
           tippecanoe --version
-          tile-join --version
+          which tile-join
           ogr2ogr --version
 
       - name: Download ENC sources
