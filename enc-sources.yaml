@@ -3,6 +3,12 @@
 # All ZIPs are downloaded from: {base_url}/{filename}
 # Output filename is derived from the source: CT_ENCs.zip -> CT_ENCs.mbtiles
 # Edit "active" to control which builds run.
+#
+# Supported modes:
+#   by-band   — auto-group by NOAA usage band (recommended for multi-state)
+#   single    — one source, default zoom range
+#   split-N   — two sources split at zoom N (e.g., split-12)
+#   sources   — explicit zoom ranges per source (use source_specs instead of sources)
 
 base_url: https://charts.noaa.gov/ENCs
 

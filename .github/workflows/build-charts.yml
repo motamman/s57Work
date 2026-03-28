@@ -111,8 +111,18 @@ jobs:
           for f in ${{ join(matrix.build.source_filenames, ' ') }}; do
             inputs="$inputs downloads/$f"
           done
+
+          mode="${{ matrix.build.mode }}"
+          mode_flags=""
+          case "$mode" in
+            by-band)    mode_flags="--by-band" ;;
+            split-*)    mode_flags="--split ${mode#split-}" ;;
+            sources)    mode_flags="" ;;  # inputs already have zoom ranges
+            single)     mode_flags="" ;;
+          esac
+
           python3 s57-to-mbtiles.py $inputs \
-            --by-band \
+            $mode_flags \
             -o "${{ matrix.build.output }}" \
             -j 2
 
@@ -153,7 +163,7 @@ jobs:
               "format": "pbf",
               "layers": layers,
               "enc_sources": [f"https://charts.noaa.gov/ENCs/{s}" for s in sources],
-              "build_date": "${{ github.event.repository.updated_at || '' }}",
+              "build_date": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
               "file_size_mb": round(os.path.getsize(mbtiles) / 1048576, 1),
           }
 
