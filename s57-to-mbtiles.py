@@ -55,6 +55,8 @@ from typing import Dict, List, Optional, Tuple
 # Constants
 # ---------------------------------------------------------------------------
 
+__version__ = "0.5.0"
+
 GDAL_IMAGE = "ghcr.io/osgeo/gdal:alpine-small-latest"
 SKIP_LAYERS = {"DSID", "C_AGGR", "C_ASSO", "Generic"}
 DATA_DIR = Path("data")
@@ -88,7 +90,7 @@ class Source:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert S-57 ENC charts (.000) to vector MBTiles",
+        description=f"s57-to-mbtiles v{__version__} — Convert S-57 ENC charts (.000) to vector MBTiles",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Single source:
@@ -126,6 +128,8 @@ Skip GDAL (use existing GeoJSON):
     parser.add_argument("-j", "--jobs", type=int,
                         default=max(1, (os.cpu_count() or 2) // 2),
                         help="Parallel workers (default: half CPU count)")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
     return parser
 
 
@@ -531,6 +535,8 @@ def run_tippecanoe_for_source(
             "--no-tile-size-limit",
             "--no-feature-limit",
             "--no-simplification",
+            "--no-tiny-polygon-reduction",
+            "--detect-shared-borders",
             "--buffer=80",
             "--force",
             "--temporary-directory", str(tmp),
