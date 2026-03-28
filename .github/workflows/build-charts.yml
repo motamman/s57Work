@@ -120,11 +120,56 @@ jobs:
         run: |
           ls -lh "data/tiles/${{ matrix.build.output }}"
 
+      - name: Generate metadata
+        shell: python3 {0}
+        run: |
+          import json, sqlite3, os
+
+          mbtiles = "data/tiles/${{ matrix.build.output }}"
+          name = os.path.splitext("${{ matrix.build.output }}")[0]
+
+          db = sqlite3.connect(mbtiles)
+          meta = dict(db.execute("SELECT name, value FROM metadata").fetchall())
+          db.close()
+
+          bounds = [float(x) for x in meta.get("bounds", "").split(",")]
+          center = [float(x) for x in meta.get("center", "").split(",")]
+
+          # Extract layer names from tippecanoe's json metadata
+          layers = []
+          if "json" in meta:
+              tile_json = json.loads(meta["json"])
+              layers = [l["id"] for l in tile_json.get("vector_layers", [])]
+
+          sources = "${{ join(matrix.build.source_filenames, ',') }}".split(",")
+
+          metadata = {
+              "name": name,
+              "description": "${{ matrix.build.name }}",
+              "bounds": bounds,
+              "center": center[:2] if len(center) >= 2 else None,
+              "minzoom": int(meta.get("minzoom", 0)),
+              "maxzoom": int(meta.get("maxzoom", 0)),
+              "format": "pbf",
+              "layers": layers,
+              "enc_sources": [f"https://charts.noaa.gov/ENCs/{s}" for s in sources],
+              "build_date": "${{ github.event.repository.updated_at || '' }}",
+              "file_size_mb": round(os.path.getsize(mbtiles) / 1048576, 1),
+          }
+
+          out = f"data/tiles/{name}.json"
+          with open(out, "w") as f:
+              json.dump(metadata, f, indent=2)
+
+          print(json.dumps(metadata, indent=2))
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.build.name }}
-          path: data/tiles/${{ matrix.build.output }}
+          path: |
+            data/tiles/${{ matrix.build.output }}
+            data/tiles/*.json
           retention-days: 7
 
   # ── Step 3: Create release, archive previous, prune old ─────────────
@@ -161,7 +206,7 @@ jobs:
           # Delete the tag if it exists so we can reuse it
           gh release delete "latest" --yes --cleanup-tag 2>/dev/null || true
 
-          files=$(find artifacts/ -name "*.mbtiles" -type f)
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f)
           echo "Creating release with files:"
           ls -lh $files
 
