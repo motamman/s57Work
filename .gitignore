@@ -1,6 +1,22 @@
+# Data pipeline artifacts
 data/zips/*
 data/enc/*
 data/geojson/*
+data/merged/*
 data/tiles/*
 !data/*/.gitkeep
-data/merged/*
+
+# CI downloads
+downloads/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
