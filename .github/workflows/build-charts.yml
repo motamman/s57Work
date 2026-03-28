@@ -1,0 +1,190 @@
+name: Build ENC Charts
+
+on:
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      builds:
+        description: 'Comma-separated build names (leave empty to use active list from enc-sources.yaml)'
+        required: false
+        default: ''
+      reuse_geojson:
+        description: 'Reuse cached GeoJSON from a previous run (skip GDAL step)'
+        type: boolean
+        required: false
+        default: false
+
+  # Uncomment to run on a schedule (e.g., weekly on Sunday at 2am UTC)
+  # schedule:
+  #   - cron: '0 2 * * 0'
+
+jobs:
+  # ── Step 1: Read the config and produce a build matrix ──────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse enc-sources.yaml
+        id: parse
+        shell: python3 {0}
+        run: |
+          import json, os, yaml
+
+          with open("enc-sources.yaml") as f:
+              config = yaml.safe_load(f)
+
+          # Use workflow_dispatch input if provided, otherwise use active list
+          override = "${{ github.event.inputs.builds }}".strip()
+          if override:
+              active = [b.strip() for b in override.split(",")]
+          else:
+              active = config.get("active", [])
+
+          base_url = config["base_url"]
+          builds = config["builds"]
+          matrix = []
+
+          for name in active:
+              if name not in builds:
+                  print(f"WARNING: build '{name}' not found in enc-sources.yaml, skipping")
+                  continue
+              b = builds[name]
+              matrix.append({
+                  "name": name,
+                  "output": b["output"],
+                  "mode": b.get("mode", "by-band"),
+                  "sources": [f"{base_url}/{s}" for s in b["sources"]],
+                  "source_filenames": b["sources"],
+              })
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps(matrix)}\n")
+
+          print(f"Active builds: {[m['name'] for m in matrix]}")
+
+  # ── Step 2: Build each active config ────────────────────────────────
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tippecanoe
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libsqlite3-dev zlib1g-dev
+          git clone https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+          cd /tmp/tippecanoe && make -j$(nproc) && sudo make install
+
+      - name: Install GDAL
+        run: |
+          sudo apt-get install -y -qq gdal-bin
+
+      - name: Verify tools
+        run: |
+          tippecanoe --version
+          tile-join --version
+          ogr2ogr --version
+
+      # ── GeoJSON cache ────────────────────────────────────────────────
+      - name: Restore cached GeoJSON
+        if: inputs.reuse_geojson == true
+        id: geojson-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/geojson
+          key: geojson-${{ matrix.build.name }}
+
+      - name: GeoJSON cache status
+        run: |
+          if [ "${{ steps.geojson-cache.outputs.cache-hit }}" = "true" ]; then
+            count=$(find data/geojson -name '*.geojson' 2>/dev/null | wc -l)
+            echo "Restored $count cached GeoJSON files — GDAL step will be skipped"
+          else
+            echo "No cached GeoJSON — full GDAL conversion will run"
+          fi
+
+      # ── Download and build ───────────────────────────────────────────
+      - name: Download ENC sources
+        run: |
+          mkdir -p downloads
+          for url in ${{ join(matrix.build.sources, ' ') }}; do
+            filename=$(basename "$url")
+            echo "Downloading $filename..."
+            curl -fSL --retry 3 --retry-delay 5 -o "downloads/$filename" "$url"
+            ls -lh "downloads/$filename"
+          done
+
+      - name: Run s57-to-mbtiles.py
+        run: |
+          chmod +x s57-to-mbtiles.py
+          inputs=""
+          for f in ${{ join(matrix.build.source_filenames, ' ') }}; do
+            inputs="$inputs downloads/$f"
+          done
+          python3 s57-to-mbtiles.py $inputs \
+            --by-band \
+            -o "${{ matrix.build.output }}" \
+            -j 2
+
+      - name: Show result
+        run: |
+          ls -lh "data/tiles/${{ matrix.build.output }}"
+
+      # ── Save GeoJSON cache (always, so next run can reuse) ───────────
+      - name: Save GeoJSON to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/geojson
+          key: geojson-${{ matrix.build.name }}-${{ github.run_id }}
+
+      # ── Upload final tiles ───────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.build.name }}
+          path: data/tiles/${{ matrix.build.output }}
+          retention-days: 7
+
+  # ── Step 3: Create a GitHub Release with all built tiles ────────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="charts-$(date +%Y%m%d-%H%M%S)"
+          echo "Creating release: $TAG"
+
+          # Collect all mbtiles files
+          files=$(find artifacts/ -name "*.mbtiles" -type f)
+          echo "Files to upload:"
+          ls -lh $files
+
+          # Create release with all files attached
+          gh release create "$TAG" \
+            --title "ENC Charts $TAG" \
+            --notes "Automated ENC chart build from NOAA S-57 data." \
+            $files
