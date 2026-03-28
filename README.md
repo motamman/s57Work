@@ -67,7 +67,32 @@ active:
   - 01cgd          # just edit this list to control what gets built
 ```
 
-Finished `.mbtiles` files are uploaded as GitHub Release assets. Trigger manually from the Actions tab or uncomment the schedule for weekly builds.
+Finished `.mbtiles` files are uploaded as GitHub Release assets. Builds run automatically on the 1st of each month (April-November) or manually from the Actions tab.
+
+## Forking
+
+This repo is designed to be forked. Each fork maintains its own builds and releases independently.
+
+1. **Fork** this repo on GitHub
+2. **Edit `enc-sources.yaml`** — set your `active` list to the regions you need
+3. **Go to Actions** tab and enable workflows on your fork
+4. **Run "Build ENC Charts"** manually, or wait for the monthly schedule
+
+The only file you need to customize is `enc-sources.yaml`. To prevent your local edits from showing up in `git status` or getting accidentally committed:
+
+```bash
+git update-index --skip-worktree enc-sources.yaml
+```
+
+To pull upstream code changes:
+
+```bash
+git remote add upstream https://github.com/motamman/s57Work.git
+git fetch upstream
+git merge upstream/main
+```
+
+If `enc-sources.yaml` conflicts on merge, keep your version — it's the one file meant to differ per fork. To undo skip-worktree (e.g., to resolve a conflict): `git update-index --no-skip-worktree enc-sources.yaml`
 
 ## NOAA band / zoom mapping
 
