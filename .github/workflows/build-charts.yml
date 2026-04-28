@@ -195,48 +195,31 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Archive previous release, create new one, prune old
+      - name: Update or create 'latest' release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          DATE=$(date +%Y%m%d-%H%M%S)
-
-          # ── Archive the current "latest" release ──
-          latest_tag=$(gh release list --limit 1 --json tagName,name \
-            --jq '.[] | select(.name == "ENC Charts") | .tagName' 2>/dev/null || true)
-          if [ -n "$latest_tag" ]; then
-            echo "Archiving previous release: $latest_tag"
-            gh release edit "$latest_tag" \
-              --title "ENC Charts ($latest_tag)" \
-              --prerelease
-          fi
-
-          # ── Create the new release (always the same tag: "latest") ──
-          # Delete the tag if it exists so we can reuse it
-          gh release delete "latest" --yes --cleanup-tag 2>/dev/null || true
-
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f)
-          echo "Creating release with files:"
+          echo "Files for release:"
           ls -lh $files
 
-          gh release create "latest" \
-            --title "ENC Charts" \
-            --notes "Automated ENC chart build from NOAA S-57 data. Built $DATE." \
-            --latest \
-            $files
+          if gh release view "latest" >/dev/null 2>&1; then
+            echo "Updating existing 'latest' release in place..."
+            # --clobber replaces same-named assets; assets from regions that
+            # weren't rebuilt this run are preserved.
+            gh release upload "latest" --clobber $files
+            gh release edit "latest" \
+              --notes "Automated ENC chart build from NOAA S-57 data. Last update: $DATE."
+          else
+            echo "Creating new 'latest' release..."
+            gh release create "latest" \
+              --title "ENC Charts" \
+              --notes "Automated ENC chart build from NOAA S-57 data. Last update: $DATE." \
+              --latest \
+              $files
+          fi
 
-          # ── Prune old archives (keep only 2 previous) ──
-          archived=$(gh release list --limit 100 --json tagName,isPrerelease \
-            --jq '[.[] | select(.isPrerelease)] | reverse | .[].tagName')
-
-          count=0
-          for old_tag in $archived; do
-            count=$((count + 1))
-            if [ $count -gt 2 ]; then
-              echo "Deleting old archive: $old_tag"
-              gh release delete "$old_tag" --yes --cleanup-tag
-            fi
-          done
-
-          echo "Done. Current + 2 archived releases retained."
+          echo "Current assets in 'latest':"
+          gh release view "latest" --json assets --jq '.assets[].name'

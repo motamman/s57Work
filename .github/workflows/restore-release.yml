@@ -1,0 +1,58 @@
+name: Restore Release Assets
+
+# One-shot recovery workflow: copies named artifacts from a prior workflow
+# run and attaches them to a release. Runs entirely on a GitHub runner;
+# nothing is downloaded locally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Workflow run ID to copy artifacts from'
+        required: true
+      artifact_names:
+        description: 'Comma-separated artifact names (e.g. 01cgd,05cgd,07cgd)'
+        required: true
+      release_tag:
+        description: 'Release tag to upload to'
+        required: false
+        default: 'latest'
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download artifacts from source run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p restore
+          IFS=',' read -ra NAMES <<< "${{ inputs.artifact_names }}"
+          for raw in "${NAMES[@]}"; do
+            name=$(echo "$raw" | xargs)
+            [ -z "$name" ] && continue
+            echo "Downloading artifact: $name (run ${{ inputs.source_run_id }})"
+            gh run download "${{ inputs.source_run_id }}" \
+              --name "$name" \
+              --dir "restore/$name"
+          done
+          echo "Files staged:"
+          find restore -type f \( -name "*.mbtiles" -o -name "*.json" \) -exec ls -lh {} \;
+
+      - name: Upload to release ${{ inputs.release_tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          files=$(find restore -type f \( -name "*.mbtiles" -o -name "*.json" \))
+          if [ -z "$files" ]; then
+            echo "ERROR: no .mbtiles/.json files found to upload"
+            exit 1
+          fi
+          gh release upload "${{ inputs.release_tag }}" --clobber $files
+          echo "Done. Current assets in '${{ inputs.release_tag }}':"
+          gh release view "${{ inputs.release_tag }}" --json assets --jq '.assets[].name'
