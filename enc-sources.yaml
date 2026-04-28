@@ -233,6 +233,45 @@ builds:
     sources:
       - AK_ENCs.zip
 
+# ─── Gap fills ─────────────────────────────────────────────────────────
+# Band 3 cells to render at band 2 zooms (z=9-10) where NOAA never published
+# a band 2 cell for the area. Without these, z=9-10 has holes in south TX,
+# the LA Morgan-City→Grand-Isle stretch (incl. Houma), and the Strait of
+# Juan de Fuca / Puget Sound. Cells not present in a given build's ENC zip
+# are silently skipped at runtime.
+
+gap_fills:
+  zoom_range: [9, 10]
+  cells:
+    # Texas Gulf coast (Brownsville → LA border)
+    - US3TX1AA
+    - US3TX1AB
+    - US3TX1AC
+    - US3TX1AD
+    - US3TX1BA
+    - US3TX1BB
+    - US3TX1BC
+    - US3TX1BD
+    - US3TX1CA
+    - US3TX1CB
+    - US3TX1CC
+    - US3TX1CD
+
+    # Louisiana coast + offshore (Morgan City → Grand Isle, incl. Houma)
+    - US3LA1AA
+    - US3LA1AB
+    - US3LA1AC
+    - US3LA1BA
+    - US3LA1BB
+    - US3LA1BC
+    - US3LA1CC
+    - US3LA1DC
+
+    # Pacific Northwest (Strait of Juan de Fuca / Puget Sound)
+    - US3WA1EE
+    - US3WA1EF
+    - US3WA1EG
+
 # ─── Active builds ─────────────────────────────────────────────────────
 # Only these run when the workflow triggers.
 # Edit this list to control what gets built.
@@ -242,3 +281,4 @@ active:
   - 05cgd
   - 07cgd
   - 08cgd
+  

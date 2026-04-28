@@ -84,6 +84,39 @@ LAYER_MIN_ZOOM_OFFSET: Dict[str, int] = {
     "SOUNDG": 1,
 }
 
+# Gap-fill config is loaded from enc-sources.yaml at runtime; see
+# load_gap_fill_config() below.
+GAP_FILL_CONFIG_FILE = "enc-sources.yaml"
+GAP_FILL_DEFAULT_ZOOMS: Tuple[int, int] = (9, 10)
+
+
+def load_gap_fill_config(
+    config_path: Optional[Path] = None,
+) -> Tuple[set, Tuple[int, int]]:
+    """Load the gap-fill cell list and zoom range from enc-sources.yaml.
+    Returns (empty set, default zooms) if the file is missing, has no
+    gap_fills section, or pyyaml is unavailable."""
+    if config_path is None:
+        candidates = [
+            Path.cwd() / GAP_FILL_CONFIG_FILE,
+            Path(__file__).resolve().parent / GAP_FILL_CONFIG_FILE,
+        ]
+        config_path = next((p for p in candidates if p.exists()), None)
+    if config_path is None or not config_path.exists():
+        return set(), GAP_FILL_DEFAULT_ZOOMS
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        print(f"WARNING: pyyaml not installed; skipping gap-fill config",
+              file=sys.stderr)
+        return set(), GAP_FILL_DEFAULT_ZOOMS
+    with open(config_path) as f:
+        data = yaml.safe_load(f) or {}
+    section = data.get("gap_fills") or {}
+    cells = set(section.get("cells") or [])
+    zr = section.get("zoom_range") or list(GAP_FILL_DEFAULT_ZOOMS)
+    return cells, (int(zr[0]), int(zr[1]))
+
 
 # ---------------------------------------------------------------------------
 # Types
@@ -671,6 +704,75 @@ def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Gap fill: render specific band 3 cells at band 2 zooms
+# ---------------------------------------------------------------------------
+
+def process_gap_fill(
+    data_dir: Path,
+    minzoom: int,
+    maxzoom: int,
+    max_workers: int,
+) -> Optional[Path]:
+    """Render the configured gap-fill cells at the configured zoom range to
+    cover NOAA's band 2 coverage holes. Reuses the band 3 GeoJSON already
+    produced by process_band. Returns the gap-fill mbtiles path, or None when
+    there's nothing to do."""
+    gap_cells, gap_zooms = load_gap_fill_config()
+    if not gap_cells:
+        return None
+
+    effective_min = max(gap_zooms[0], minzoom)
+    effective_max = min(gap_zooms[1], maxzoom)
+    if effective_min > effective_max:
+        return None
+
+    band3_geojson = data_dir / "geojson" / "band3"
+    if not band3_geojson.is_dir():
+        return None
+
+    present_cells = sorted(
+        c for c in gap_cells
+        if any(band3_geojson.glob(f"*_{c}.geojson"))
+    )
+    if not present_cells:
+        return None
+
+    print(f"\n-- Gap fill: {len(present_cells)} band-3 cell(s) at "
+          f"z{effective_min}-{effective_max} --")
+    print(f"   Cells: {', '.join(present_cells)}")
+
+    # Group the per-cell geojson files by layer name (matches the convention
+    # used by consolidate_geojson: filename is "LAYER_CELLSTEM.geojson").
+    layer_groups: Dict[str, List[Path]] = {}
+    for cell in present_cells:
+        for f in band3_geojson.glob(f"*_{cell}.geojson"):
+            if f.stat().st_size <= 100:
+                continue
+            layer_name = f.stem.split("_")[0]
+            layer_groups.setdefault(layer_name, []).append(f)
+
+    if not layer_groups:
+        return None
+
+    gap_merged_dir = data_dir / "merged" / "gapfill"
+    gap_merged_dir.mkdir(parents=True, exist_ok=True)
+
+    for layer_name, files in layer_groups.items():
+        out_path = gap_merged_dir / f"{layer_name}.geojson"
+        if output_is_fresh(out_path, files):
+            continue
+        if len(files) == 1:
+            shutil.copy2(files[0], out_path)
+        else:
+            merge_geojson_layer(layer_name, files, out_path)
+
+    tile_dir = data_dir / "tiles"
+    return run_tippecanoe_for_source(
+        gap_merged_dir, tile_dir, "gapfill",
+        effective_min, effective_max, max_workers=max_workers)
+
+
+# ---------------------------------------------------------------------------
 # Band pipeline (stages 2-4 for one band)
 # ---------------------------------------------------------------------------
 
@@ -826,8 +928,17 @@ def process_by_band(
         print("ERROR: No tiles produced", file=sys.stderr)
         sys.exit(1)
 
+    gap_tiles_path = process_gap_fill(data_dir, minzoom, maxzoom, max_workers)
+
     # Coarse → fine ordering by band number (band 1 = overview, band 6 = berthing)
-    return [band_tiles[b] for b in sorted(band_tiles)]
+    sorted_bands = sorted(band_tiles)
+    ordered = [band_tiles[b] for b in sorted_bands]
+    if gap_tiles_path is not None:
+        # Slot between band 2 and band 3 so band 3 detail wins on overlap.
+        insert_idx = next((i for i, b in enumerate(sorted_bands) if b > 2),
+                          len(ordered))
+        ordered.insert(insert_idx, gap_tiles_path)
+    return ordered
 
 
 # ---------------------------------------------------------------------------
