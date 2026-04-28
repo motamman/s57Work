@@ -30,7 +30,7 @@ PIPELINE (per band or source)
   1. Extract ZIPs → data/enc/
   2. ogr2ogr (native or container) → data/geojson/
   3. Consolidate per-layer GeoJSON → data/merged/
-  4. tippecanoe (per-zoom) → data/tiles/
+  4. tippecanoe (one per band, full zoom range) → data/tiles/
   5. tile-join → final .mbtiles
 
 All artifacts stored in ./data/, nothing deleted between runs.
@@ -55,7 +55,7 @@ from typing import Dict, List, Optional, Tuple
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 GDAL_IMAGE = "ghcr.io/osgeo/gdal:alpine-small-latest"
 SKIP_LAYERS = {"DSID", "C_AGGR", "C_ASSO", "Generic"}
@@ -68,6 +68,20 @@ BAND_ZOOM: Dict[int, Tuple[int, int, str, str]] = {
     4: (13, 14, "approach",  "~1:22,000"),
     5: (15, 16, "harbour",   "~1:8,000"),
     6: (17, 18, "berthing",  "~1:3,000"),
+}
+
+# Per-layer minzoom offset (in zoom levels) from a band's minzoom.
+# Layers not listed default to 0 (emit from band's bottom zoom).
+# Heavy/dense layers get +1 so they only appear at the top of the band.
+LAYER_MIN_ZOOM_OFFSET: Dict[str, int] = {
+    # Aids to navigation — only meaningful at approach detail or finer
+    "LIGHTS": 1,
+    "BCNLAT": 1, "BCNCAR": 1, "BCNISD": 1, "BCNSPP": 1,
+    "BOYLAT": 1, "BOYCAR": 1, "BOYISD": 1, "BOYSAW": 1, "BOYSPP": 1,
+    # Hazards — same logic
+    "OBSTRN": 1, "WRECKS": 1, "UWTROC": 1,
+    # Soundings — extremely dense; push to top of band
+    "SOUNDG": 1,
 }
 
 
@@ -241,6 +255,41 @@ def pull_image(runtime: str, image: str):
 
 
 # ---------------------------------------------------------------------------
+# Freshness helpers (mtime-based skip for incremental rebuilds)
+# ---------------------------------------------------------------------------
+
+def output_is_fresh(output: Path, inputs: List[Path]) -> bool:
+    """True if `output` exists, is non-empty, and is newer than every input."""
+    if not output.exists() or output.stat().st_size <= 100:
+        return False
+    output_mtime = output.stat().st_mtime
+    for p in inputs:
+        if not p.exists():
+            continue
+        if p.stat().st_mtime > output_mtime:
+            return False
+    return True
+
+
+def cell_outputs_fresh(enc_path: Path, geojson_dir: Path,
+                       multi_file: bool) -> bool:
+    """True if all GeoJSON outputs for this cell are newer than every source
+    file (.000 + any .001..NNN ER updates in the same directory)."""
+    cell_stem = enc_path.stem
+    sources = list(enc_path.parent.glob(f"{cell_stem}.*"))
+    if not sources:
+        return False
+    source_mtime = max(s.stat().st_mtime for s in sources)
+    if multi_file:
+        outputs = list(geojson_dir.glob(f"*_{cell_stem}.geojson"))
+    else:
+        outputs = list(geojson_dir.glob("*.geojson"))
+    if not outputs:
+        return False
+    return all(o.stat().st_mtime >= source_mtime for o in outputs)
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: Input staging
 # ---------------------------------------------------------------------------
 
@@ -292,19 +341,30 @@ def export_to_geojson(
     max_workers: int = 1,
 ) -> List[Path]:
     tag = f"[{label}] " if label else ""
+    multi_file = len(enc_files) > 1
 
-    # Resume: skip if geojson already exists
-    existing = [f for f in geojson_dir.glob("*.geojson") if f.stat().st_size > 100]
-    if existing:
-        print(f"{tag}GeoJSON exists ({len(existing)} layers), skipping GDAL")
+    # Per-cell freshness: only re-export cells whose source(s) are newer
+    # than their existing GeoJSON outputs.
+    cells_to_process = [
+        f for f in enc_files
+        if not cell_outputs_fresh(f, geojson_dir, multi_file)
+    ]
+
+    if not cells_to_process:
+        existing = [f for f in geojson_dir.glob("*.geojson")
+                    if f.stat().st_size > 100]
+        print(f"{tag}GeoJSON fresh ({len(existing)} layers), skipping GDAL")
         return existing
 
-    print(f"{tag}GDAL: converting {len(enc_files)} ENC file(s) to GeoJSON...")
+    print(f"{tag}GDAL: converting {len(cells_to_process)}/{len(enc_files)} "
+          f"cell(s) to GeoJSON...")
 
     if native_gdal:
-        _export_native(enc_dir, geojson_dir, enc_files, tag, max_workers)
+        _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
+                       tag, max_workers)
     else:
-        _export_container(runtime, enc_dir, geojson_dir, enc_files, tag, label)
+        _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
+                          multi_file, tag, label)
 
     valid = []
     for f in list(geojson_dir.glob("*.geojson")):
@@ -317,10 +377,9 @@ def export_to_geojson(
     return valid
 
 
-def _export_native(enc_dir, geojson_dir, enc_files, tag, max_workers):
-    multi_file = len(enc_files) > 1
-    actual_files = sorted(enc_dir.rglob("*.000"))
-    total = len(actual_files)
+def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
+                   tag, max_workers):
+    total = len(cells_to_process)
     done = [0]
 
     def process_enc(enc: Path):
@@ -341,6 +400,8 @@ def _export_native(enc_dir, geojson_dir, enc_files, tag, max_workers):
                 continue
             outname = f"{layer}_{name}" if multi_file else layer
             outpath = geojson_dir / f"{outname}.geojson"
+            if outpath.exists():
+                outpath.unlink()
             cmd = ["ogr2ogr", "-f", "GeoJSON", "-oo", "LIST_AS_STRING=YES"]
             if layer == "SOUNDG":
                 cmd.extend(["-oo", "SPLIT_MULTIPOINT=YES",
@@ -352,11 +413,12 @@ def _export_native(enc_dir, geojson_dir, enc_files, tag, max_workers):
         print(f"{tag}[{done[0]}/{total}] {name}")
 
     if max_workers <= 1:
-        for enc in actual_files:
+        for enc in cells_to_process:
             process_enc(enc)
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(process_enc, enc): enc for enc in actual_files}
+            futures = {pool.submit(process_enc, enc): enc
+                       for enc in cells_to_process}
             for future in as_completed(futures):
                 exc = future.exception()
                 if exc:
@@ -366,17 +428,23 @@ def _export_native(enc_dir, geojson_dir, enc_files, tag, max_workers):
     print(f"{tag}Export complete")
 
 
-def _export_container(runtime, enc_dir, geojson_dir, enc_files, tag, label):
-    multi_file = len(enc_files) > 1
+def _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
+                      multi_file, tag, label):
     skip_case = "|".join(SKIP_LAYERS)
     name_template = "${layer}_${name}" if multi_file else "${layer}"
 
+    # Pass explicit relative paths so the container processes only the
+    # cells the freshness check decided are stale.
+    rel_paths = [str(c.relative_to(enc_dir)) for c in cells_to_process]
+    cells_arg = " ".join(rel_paths)
+
     script = f"""
 set -e
-enc_files=$(find /input -name '*.000' -type f)
-count=$(echo "$enc_files" | wc -l)
+cells="{cells_arg}"
+count=$(echo "$cells" | wc -w)
 i=0
-for enc in $enc_files; do
+for rel in $cells; do
+  enc="/input/$rel"
   i=$((i + 1))
   name=$(basename "$enc" .000)
   echo "[$i/$count] $name"
@@ -384,6 +452,7 @@ for enc in $enc_files; do
   for layer in $layers; do
     case "$layer" in {skip_case}) continue ;; esac
     outname="{name_template}"
+    rm -f "/output/$outname.geojson"
     if [ "$layer" = "SOUNDG" ]; then
       ogr2ogr -f GeoJSON -oo SPLIT_MULTIPOINT=YES -oo ADD_SOUNDG_DEPTH=YES \
         -oo LIST_AS_STRING=YES \
@@ -440,12 +509,6 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
     Returns list of merged file paths."""
     merged_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check resume: if merged dir already has files, skip
-    existing = [f for f in merged_dir.glob("*.geojson") if f.stat().st_size > 100]
-    if existing:
-        print(f"  Merged GeoJSON exists ({len(existing)} layers), skipping")
-        return existing
-
     geojson_files = [f for f in sorted(geojson_dir.glob("*.geojson"))
                      if f.stat().st_size > 100]
     if not geojson_files:
@@ -457,25 +520,38 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
         layer_name = f.stem.split("_")[0] if "_" in f.stem else f.stem
         layer_groups.setdefault(layer_name, []).append(f)
 
-    print(f"  Consolidating {len(geojson_files)} files -> {len(layer_groups)} layers...")
+    # Per-layer freshness pre-pass
+    fresh: List[Path] = []
+    stale: List[Tuple[str, List[Path], Path]] = []
+    for layer_name, files in layer_groups.items():
+        out_path = merged_dir / f"{layer_name}.geojson"
+        if output_is_fresh(out_path, files):
+            fresh.append(out_path)
+        else:
+            stale.append((layer_name, files, out_path))
+
+    if not stale:
+        print(f"  All {len(layer_groups)} merged layers fresh, skipping")
+        return sorted(fresh)
+
+    print(f"  Consolidating {len(stale)}/{len(layer_groups)} layers "
+          f"(others fresh)...")
 
     def merge_one(item):
-        layer_name, files = item
-        out_path = merged_dir / f"{layer_name}.geojson"
+        layer_name, files, out_path = item
         if len(files) == 1:
-            # Single file: just copy (or symlink)
             shutil.copy2(files[0], out_path)
         else:
             merge_geojson_layer(layer_name, files, out_path)
         return out_path
 
     if max_workers <= 1:
-        results = [merge_one(item) for item in layer_groups.items()]
+        results = [merge_one(item) for item in stale]
     else:
         results = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(merge_one, item): item[0]
-                       for item in layer_groups.items()}
+                       for item in stale}
             for future in as_completed(futures):
                 exc = future.exception()
                 if exc:
@@ -484,12 +560,12 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
                 else:
                     results.append(future.result())
 
-    print(f"  Consolidated into {len(results)} merged layers")
-    return sorted(results)
+    print(f"  Consolidated {len(results)} layers (+ {len(fresh)} fresh)")
+    return sorted(fresh + results)
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: tippecanoe (per-zoom, parallel)
+# Stage 4: tippecanoe (one invocation per band, full zoom range)
 # ---------------------------------------------------------------------------
 
 def run_tippecanoe_for_source(
@@ -498,79 +574,65 @@ def run_tippecanoe_for_source(
     stem: str,
     minzoom: int,
     maxzoom: int,
-    max_workers: int = 1,
-) -> List[Tuple[int, Path]]:
-    """Run tippecanoe per-zoom using merged GeoJSON files.
-    Returns list of (zoom, path) tuples."""
+    max_workers: int = 1,  # unused; tippecanoe handles its own threading
+) -> Optional[Path]:
+    """Run a single tippecanoe over [minzoom, maxzoom] using merged GeoJSON.
+    Each layer carries its own minzoom from LAYER_MIN_ZOOM_OFFSET via the
+    JSON layer-spec form of -L. Returns the produced .mbtiles path, or None
+    if there's nothing to build."""
     merged_files = [f for f in sorted(merged_dir.glob("*.geojson"))
                     if f.stat().st_size > 100]
     if not merged_files:
         print(f"WARNING: No GeoJSON in {merged_dir}, skipping", file=sys.stderr)
-        return []
+        return None
 
-    # Build -L args from merged files (one per layer, well under ARG_MAX)
+    final = tile_dir / f"{stem}.mbtiles"
+
+    if output_is_fresh(final, merged_files):
+        print(f"  [{stem}] z{minzoom}-{maxzoom}: fresh "
+              f"({final.stat().st_size / 1048576:.1f} MB), skipping")
+        return final
+
+    # Build per-layer JSON layer specs with per-layer minzoom
     layer_args = []
     for f in merged_files:
         layer_name = f.stem
-        layer_args.extend(["-L", f"{layer_name}:{f}"])
+        layer_min = min(minzoom + LAYER_MIN_ZOOM_OFFSET.get(layer_name, 0),
+                        maxzoom)
+        spec = {"file": str(f), "layer": layer_name, "minzoom": layer_min}
+        layer_args.extend(["-L", json.dumps(spec)])
 
     print(f"tippecanoe [{stem}]: {len(merged_files)} layers, "
-          f"z{minzoom}-{maxzoom} ({max_workers} workers)")
+          f"z{minzoom}-{maxzoom}")
 
-    def build_zoom(z: int) -> Tuple[int, Path]:
-        final = tile_dir / f"{stem}_z{z}.mbtiles"
-        if final.exists() and final.stat().st_size > 0:
-            print(f"  [{stem}] z{z}: exists "
-                  f"({final.stat().st_size / 1048576:.1f} MB), skipping")
-            return (z, final)
+    tmp = (tile_dir / f".tmp-{stem}").resolve()
+    tmp.mkdir(exist_ok=True)
 
-        tmp = (tile_dir / f".tmp-{stem}-z{z}").resolve()
-        tmp.mkdir(exist_ok=True)
+    cmd = [
+        "tippecanoe",
+        "-o", str(final),
+        "-Z", str(minzoom), "-z", str(maxzoom),
+        "--no-tile-size-limit",
+        "--no-feature-limit",
+        "--no-simplification",
+        "--no-tiny-polygon-reduction",
+        "--detect-shared-borders",
+        "--buffer=80",
+        "--force",
+        "--temporary-directory", str(tmp),
+        *layer_args,
+    ]
+    result = subprocess.run(cmd)
+    shutil.rmtree(tmp, ignore_errors=True)
 
-        print(f"  [{stem}] z{z}: running...")
-        cmd = [
-            "tippecanoe",
-            "-o", str(final),
-            "-z", str(z), "-Z", str(z),
-            "--no-tile-size-limit",
-            "--no-feature-limit",
-            "--no-simplification",
-            "--no-tiny-polygon-reduction",
-            "--detect-shared-borders",
-            "--buffer=80",
-            "--force",
-            "--temporary-directory", str(tmp),
-            *layer_args,
-        ]
-        result = subprocess.run(cmd)
-        shutil.rmtree(tmp, ignore_errors=True)
+    if result.returncode != 0 or not final.exists() or final.stat().st_size == 0:
+        if final.exists():
+            final.unlink()
+        raise RuntimeError(f"tippecanoe failed for {stem}")
 
-        if result.returncode != 0 or not final.exists() or final.stat().st_size == 0:
-            if final.exists():
-                final.unlink()
-            raise RuntimeError(f"tippecanoe failed on z{z}")
-
-        _patch_metadata(final, f"{stem} z{z}")
-        print(f"  [{stem}] z{z}: done "
-              f"({final.stat().st_size / 1048576:.1f} MB)")
-        return (z, final)
-
-    zooms = list(range(minzoom, maxzoom + 1))
-
-    if max_workers <= 1:
-        results = [build_zoom(z) for z in zooms]
-    else:
-        results = []
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(build_zoom, z): z for z in zooms}
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except RuntimeError as e:
-                    print(f"ERROR: {e}", file=sys.stderr)
-                    sys.exit(1)
-
-    return sorted(results, key=lambda x: x[0])
+    _patch_metadata(final, stem)
+    print(f"  [{stem}] done ({final.stat().st_size / 1048576:.1f} MB)")
+    return final
 
 
 def _patch_metadata(mbtiles_path: Path, name: str):
@@ -623,8 +685,8 @@ def process_band(
     native_gdal: bool,
     runtime: Optional[str],
     max_workers: int,
-) -> List[Tuple[int, Path]]:
-    """Run stages 2-4 for a single band. Returns per-zoom (zoom, path) list."""
+) -> Optional[Path]:
+    """Run stages 2-4 for a single band. Returns the band's .mbtiles path."""
     label = f"band{band}-{desc}"
     print(f"\n-- Band {band}: {desc} ({scale})  z{effective_min}-{effective_max} --")
 
@@ -640,22 +702,29 @@ def process_band(
     band_enc_dir.mkdir(parents=True, exist_ok=True)
     band_geojson_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy ENC files for this band
+    # Copy each cell's .000 base AND any .001..NNN ER update files.
+    # Without the update files, ogr2ogr applies only the base — incremental
+    # NOAA chart updates would be silently dropped.
+    band_cells: List[Path] = []
     for enc_file in enc_files:
-        dest = band_enc_dir / enc_file.name
-        if not dest.exists():
-            shutil.copy2(enc_file, dest)
+        cell_stem = enc_file.stem
+        for src in enc_file.parent.glob(f"{cell_stem}.*"):
+            dest = band_enc_dir / src.name
+            if (not dest.exists()
+                    or src.stat().st_mtime > dest.stat().st_mtime):
+                shutil.copy2(src, dest)
+        band_cells.append(band_enc_dir / enc_file.name)
 
     # Stage 2: GDAL export
     export_to_geojson(
-        band_enc_dir, band_geojson_dir, enc_files, label=label,
+        band_enc_dir, band_geojson_dir, band_cells, label=label,
         native_gdal=native_gdal, runtime=runtime, max_workers=max_workers)
 
     # Stage 3: Consolidate
     consolidate_geojson(band_geojson_dir, band_merged_dir,
                         max_workers=max_workers)
 
-    # Stage 4: tippecanoe per-zoom
+    # Stage 4: one tippecanoe for the band
     return run_tippecanoe_for_source(
         band_merged_dir, tile_dir, label,
         effective_min, effective_max, max_workers=max_workers)
@@ -673,7 +742,7 @@ def process_by_band(
     native_gdal: bool,
     runtime: Optional[str],
     max_workers: int,
-) -> List[Tuple[int, Path]]:
+) -> List[Path]:
     print("\n-- By-band mode ---------------------------------------------------")
 
     # Stage 1: stage all inputs
@@ -725,14 +794,15 @@ def process_by_band(
     # but bands run concurrently via threads.
     # Each band's internal stages use subprocess calls that the OS
     # schedules across cores.
-    all_results: List[Tuple[int, Path]] = []
+    band_tiles: Dict[int, Path] = {}
 
     if len(band_tasks) <= 1 or max_workers <= 1:
         for band, files, emin, emax, desc, scale in band_tasks:
-            results = process_band(
+            result = process_band(
                 band, files, data_dir, emin, emax, desc, scale,
                 native_gdal, runtime, max_workers)
-            all_results.extend(results)
+            if result is not None:
+                band_tiles[band] = result
     else:
         with ThreadPoolExecutor(max_workers=min(len(band_tasks),
                                                 max_workers)) as pool:
@@ -748,13 +818,16 @@ def process_by_band(
                     print(f"ERROR: band {futures[future]}: {exc}",
                           file=sys.stderr)
                     sys.exit(1)
-                all_results.extend(future.result())
+                result = future.result()
+                if result is not None:
+                    band_tiles[futures[future]] = result
 
-    if not all_results:
+    if not band_tiles:
         print("ERROR: No tiles produced", file=sys.stderr)
         sys.exit(1)
 
-    return all_results
+    # Coarse → fine ordering by band number (band 1 = overview, band 6 = berthing)
+    return [band_tiles[b] for b in sorted(band_tiles)]
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +841,7 @@ def process_source(
     native_gdal: bool,
     runtime: Optional[str],
     max_workers: int,
-) -> List[Tuple[int, Path]]:
+) -> Optional[Path]:
     label = source.label or f"source{idx}"
     safe_label = re.sub(r'[^\w\-.]', '_', label)
 
@@ -844,12 +917,11 @@ def main():
                 print(f"ERROR: {p} not found", file=sys.stderr)
                 sys.exit(1)
 
-        zoom_tiles = process_by_band(
+        # process_by_band returns one .mbtiles per band, ordered coarse → fine
+        tile_files = process_by_band(
             input_paths, data_dir, args.minzoom, args.maxzoom,
             native_gdal, runtime, args.jobs)
 
-        # Sort coarse→fine, tile-join detail wins
-        tile_files = [p for _, p in sorted(zoom_tiles, key=lambda x: x[0])]
         if len(tile_files) == 1:
             shutil.copy2(tile_files[0], tiles_path)
             _patch_metadata(tiles_path, tiles_path.stem)
@@ -858,21 +930,30 @@ def main():
 
         print(f"\nSummary (by-band):")
         print(f"  Inputs: {', '.join(p.name for p in input_paths)}")
-        for z, path in sorted(zoom_tiles, key=lambda x: x[0]):
-            print(f"  z{z}: {path.name} "
+        for path in tile_files:
+            print(f"  {path.name} "
                   f"({path.stat().st_size / 1048576:.1f} MB)")
 
     else:
         sources = build_sources(args, parser)
         validate_sources(sources)
 
-        zoom_tiles = []
+        # Pair each source's mbtiles with its minzoom for coarse→fine sort
+        source_tiles: List[Tuple[int, Path]] = []
         for i, source in enumerate(sources):
-            zoom_tiles.extend(process_source(
+            result = process_source(
                 source, data_dir, i + 1,
-                native_gdal, runtime, args.jobs))
+                native_gdal, runtime, args.jobs)
+            if result is not None:
+                source_tiles.append((source.minzoom, result))
 
-        tile_files = [p for _, p in sorted(zoom_tiles, key=lambda x: x[0])]
+        if not source_tiles:
+            print("ERROR: No tiles produced", file=sys.stderr)
+            sys.exit(1)
+
+        source_tiles.sort(key=lambda x: x[0])
+        tile_files = [p for _, p in source_tiles]
+
         if len(tile_files) == 1:
             shutil.copy2(tile_files[0], tiles_path)
             _patch_metadata(tiles_path, tiles_path.stem)
