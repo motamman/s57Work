@@ -84,18 +84,35 @@ LAYER_MIN_ZOOM_OFFSET: Dict[str, int] = {
     "SOUNDG": 1,
 }
 
-# Gap-fill config is loaded from enc-sources.yaml at runtime; see
-# load_gap_fill_config() below.
+# Gap-fill config lives in enc-sources.yaml under the `gap_fills:` key.
+# See the comment block in that file for full background on what gap-fill
+# is, why it's needed (NOAA legacy ENC discontinuities, addressed by the
+# in-progress ENC Rescheming Project), and how to add new gaps.
 GAP_FILL_CONFIG_FILE = "enc-sources.yaml"
-GAP_FILL_DEFAULT_ZOOMS: Tuple[int, int] = (9, 10)
+
+
+@dataclass
+class GapFillGroup:
+    """One group of cells to render at a custom zoom range as a gap fill.
+    Loaded from the `gap_fills:` list in enc-sources.yaml."""
+    name: str
+    zoom_range: Tuple[int, int]
+    cells: List[str]
+    description: str = ""
 
 
 def load_gap_fill_config(
     config_path: Optional[Path] = None,
-) -> Tuple[set, Tuple[int, int]]:
-    """Load the gap-fill cell list and zoom range from enc-sources.yaml.
-    Returns (empty set, default zooms) if the file is missing, has no
-    gap_fills section, or pyyaml is unavailable."""
+) -> List[GapFillGroup]:
+    """Load the list of gap-fill groups from enc-sources.yaml.
+
+    Returns an empty list (gap-fill becomes a no-op) if the file is
+    missing, has no `gap_fills:` section, or pyyaml is unavailable.
+
+    Accepts both the current list-of-groups schema (multiple named
+    groups, each with its own zoom_range) and the legacy flat schema
+    (a single zoom_range + cells dict), to keep older configs working.
+    """
     if config_path is None:
         candidates = [
             Path.cwd() / GAP_FILL_CONFIG_FILE,
@@ -103,19 +120,44 @@ def load_gap_fill_config(
         ]
         config_path = next((p for p in candidates if p.exists()), None)
     if config_path is None or not config_path.exists():
-        return set(), GAP_FILL_DEFAULT_ZOOMS
+        return []
     try:
         import yaml  # type: ignore
     except ImportError:
-        print(f"WARNING: pyyaml not installed; skipping gap-fill config",
+        print("WARNING: pyyaml not installed; skipping gap-fill config",
               file=sys.stderr)
-        return set(), GAP_FILL_DEFAULT_ZOOMS
+        return []
     with open(config_path) as f:
         data = yaml.safe_load(f) or {}
-    section = data.get("gap_fills") or {}
-    cells = set(section.get("cells") or [])
-    zr = section.get("zoom_range") or list(GAP_FILL_DEFAULT_ZOOMS)
-    return cells, (int(zr[0]), int(zr[1]))
+    section = data.get("gap_fills")
+    if not section:
+        return []
+
+    groups: List[GapFillGroup] = []
+    if isinstance(section, list):
+        # Current schema: list of groups
+        for i, g in enumerate(section):
+            cells = list(g.get("cells") or [])
+            zr = g.get("zoom_range") or [9, 10]
+            if not cells:
+                continue
+            groups.append(GapFillGroup(
+                name=g.get("name") or f"gapfill{i}",
+                zoom_range=(int(zr[0]), int(zr[1])),
+                cells=cells,
+                description=g.get("description", ""),
+            ))
+    elif isinstance(section, dict):
+        # Legacy schema: single group inline
+        cells = list(section.get("cells") or [])
+        zr = section.get("zoom_range") or [9, 10]
+        if cells:
+            groups.append(GapFillGroup(
+                name="gapfill",
+                zoom_range=(int(zr[0]), int(zr[1])),
+                cells=cells,
+            ))
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -704,48 +746,120 @@ def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Gap fill: render specific band 3 cells at band 2 zooms
+# Gap fill: render high-band detail cells at lower zooms to cover
+#           documented NOAA legacy-ENC coverage holes.
 # ---------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# NOAA's legacy ENCs were compiled cell-by-cell from paper-chart sources
+# at fixed scales over many years. The result is genuine discontinuities
+# in the lower-band overview cells: certain coastal stretches have band
+# 3+ detail cells but no band 2 (z=9-10) cell at all, or have band 2 and
+# band 3 catalog cells whose actual polygons stop short of the coast,
+# leaving holes at z=9-12.
+#
+# NOAA acknowledges this and is rebuilding the ENC catalog as a continuous
+# gridded dataset under the multi-year ENC Rescheming Project, working
+# from band 5 outward (band 5 first, then 4, 3, 2, 1). Until band 2 is
+# fully reschemed, this script's "gap fill" pass synthesizes the missing
+# overview/general/coastal coverage by rendering the band 3-5 detail
+# cells at lower zooms.
+#
+# How it works
+# ------------
+# Each `gap_fills:` group in enc-sources.yaml lists a set of higher-band
+# cell IDs and a zoom_range. process_gap_fill():
+#   1. Globs the existing per-band GeoJSON output (data/geojson/band*/)
+#      for files matching each cell ID. Cells not present in this build's
+#      input are silently skipped.
+#   2. Consolidates the matching per-cell GeoJSON into a per-group merged
+#      directory, grouped by layer name.
+#   3. Runs one tippecanoe pass per group at its configured zoom_range,
+#      producing data/tiles/gapfill-<group>.mbtiles.
+#
+# The resulting mbtiles paths are inserted into the final tile-join order
+# between band 2 and band 3 (see process_by_band). Since `tile-join` lets
+# later inputs win on overlap, original-band detail still wins everywhere
+# it has data — fills only show up in tiles the original bands left empty.
+#
+# References (full context in the gap_fills: comment block of
+# enc-sources.yaml):
+#   • Rescheming program:
+#       https://nauticalcharts.noaa.gov/charts/rescheming-and-improving-electronic-navigational-charts.html
+#   • Cell creation status map:
+#       https://nauticalcharts.noaa.gov/updates/follow-the-status-of-electronic-navigational-chart-improvements-with-noaas-new-map-viewer/
 
 def process_gap_fill(
     data_dir: Path,
     minzoom: int,
     maxzoom: int,
     max_workers: int,
-) -> Optional[Path]:
-    """Render the configured gap-fill cells at the configured zoom range to
-    cover NOAA's band 2 coverage holes. Reuses the band 3 GeoJSON already
-    produced by process_band. Returns the gap-fill mbtiles path, or None when
-    there's nothing to do."""
-    gap_cells, gap_zooms = load_gap_fill_config()
-    if not gap_cells:
-        return None
+) -> List[Path]:
+    """Run one tippecanoe pass per configured gap-fill group.
 
-    effective_min = max(gap_zooms[0], minzoom)
-    effective_max = min(gap_zooms[1], maxzoom)
+    Returns a list of mbtiles paths produced (empty list if nothing to do
+    or no cells matched in this build). The caller is responsible for
+    inserting these into the tile-join order at the right spot — see
+    process_by_band().
+    """
+    groups = load_gap_fill_config()
+    if not groups:
+        return []
+
+    geojson_root = data_dir / "geojson"
+    if not geojson_root.is_dir():
+        return []
+
+    out_paths: List[Path] = []
+    for group in groups:
+        out = _process_gap_fill_group(
+            group, data_dir, geojson_root, minzoom, maxzoom, max_workers)
+        if out is not None:
+            out_paths.append(out)
+    return out_paths
+
+
+def _process_gap_fill_group(
+    group: GapFillGroup,
+    data_dir: Path,
+    geojson_root: Path,
+    minzoom: int,
+    maxzoom: int,
+    max_workers: int,
+) -> Optional[Path]:
+    """Render one gap-fill group's cells at its configured zoom range."""
+    effective_min = max(group.zoom_range[0], minzoom)
+    effective_max = min(group.zoom_range[1], maxzoom)
     if effective_min > effective_max:
         return None
 
-    band3_geojson = data_dir / "geojson" / "band3"
-    if not band3_geojson.is_dir():
+    # Cells live in whichever band's geojson dir matches their ID prefix.
+    # We just glob across all band* dirs to find each requested cell —
+    # cells absent from this build's ENC input produce no matches and
+    # are silently skipped.
+    cell_files: Dict[str, List[Path]] = {}
+    for cell_id in group.cells:
+        matches: List[Path] = []
+        for band_dir in sorted(geojson_root.glob("band*")):
+            if band_dir.is_dir():
+                matches.extend(band_dir.glob(f"*_{cell_id}.geojson"))
+        if matches:
+            cell_files[cell_id] = matches
+
+    if not cell_files:
         return None
 
-    present_cells = sorted(
-        c for c in gap_cells
-        if any(band3_geojson.glob(f"*_{c}.geojson"))
-    )
-    if not present_cells:
-        return None
-
-    print(f"\n-- Gap fill: {len(present_cells)} band-3 cell(s) at "
+    present = sorted(cell_files)
+    print(f"\n-- Gap fill [{group.name}]: {len(present)} cell(s) at "
           f"z{effective_min}-{effective_max} --")
-    print(f"   Cells: {', '.join(present_cells)}")
+    print(f"   Cells: {', '.join(present)}")
 
-    # Group the per-cell geojson files by layer name (matches the convention
-    # used by consolidate_geojson: filename is "LAYER_CELLSTEM.geojson").
+    # Group per-cell GeoJSON files by layer name. The naming convention
+    # comes from process_band's GDAL export step: "LAYER_CELLSTEM.geojson".
     layer_groups: Dict[str, List[Path]] = {}
-    for cell in present_cells:
-        for f in band3_geojson.glob(f"*_{cell}.geojson"):
+    for files in cell_files.values():
+        for f in files:
             if f.stat().st_size <= 100:
                 continue
             layer_name = f.stem.split("_")[0]
@@ -754,11 +868,12 @@ def process_gap_fill(
     if not layer_groups:
         return None
 
-    gap_merged_dir = data_dir / "merged" / "gapfill"
-    gap_merged_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r'[^\w\-.]', '_', group.name)
+    merged_dir = data_dir / "merged" / f"gapfill-{safe_name}"
+    merged_dir.mkdir(parents=True, exist_ok=True)
 
     for layer_name, files in layer_groups.items():
-        out_path = gap_merged_dir / f"{layer_name}.geojson"
+        out_path = merged_dir / f"{layer_name}.geojson"
         if output_is_fresh(out_path, files):
             continue
         if len(files) == 1:
@@ -768,7 +883,7 @@ def process_gap_fill(
 
     tile_dir = data_dir / "tiles"
     return run_tippecanoe_for_source(
-        gap_merged_dir, tile_dir, "gapfill",
+        merged_dir, tile_dir, f"gapfill-{safe_name}",
         effective_min, effective_max, max_workers=max_workers)
 
 
@@ -928,16 +1043,25 @@ def process_by_band(
         print("ERROR: No tiles produced", file=sys.stderr)
         sys.exit(1)
 
-    gap_tiles_path = process_gap_fill(data_dir, minzoom, maxzoom, max_workers)
+    # Gap fill: one mbtiles per configured group. See process_gap_fill()
+    # and the `gap_fills:` comment block in enc-sources.yaml for the full
+    # rationale (NOAA legacy-ENC discontinuities being closed by the ENC
+    # Rescheming Project).
+    gap_tile_paths = process_gap_fill(data_dir, minzoom, maxzoom, max_workers)
 
     # Coarse → fine ordering by band number (band 1 = overview, band 6 = berthing)
     sorted_bands = sorted(band_tiles)
     ordered = [band_tiles[b] for b in sorted_bands]
-    if gap_tiles_path is not None:
-        # Slot between band 2 and band 3 so band 3 detail wins on overlap.
+    if gap_tile_paths:
+        # Slot all fills between band 2 and band 3. tile-join lets later
+        # inputs win on overlap, so this position lets the original band
+        # 3+ outputs win wherever they have data — fills only appear in
+        # tiles the original bands left empty.
         insert_idx = next((i for i, b in enumerate(sorted_bands) if b > 2),
                           len(ordered))
-        ordered.insert(insert_idx, gap_tiles_path)
+        for p in gap_tile_paths:
+            ordered.insert(insert_idx, p)
+            insert_idx += 1
     return ordered
 
 

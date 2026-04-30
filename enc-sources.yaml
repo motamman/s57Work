@@ -234,43 +234,137 @@ builds:
       - AK_ENCs.zip
 
 # ─── Gap fills ─────────────────────────────────────────────────────────
-# Band 3 cells to render at band 2 zooms (z=9-10) where NOAA never published
-# a band 2 cell for the area. Without these, z=9-10 has holes in south TX,
-# the LA Morgan-City→Grand-Isle stretch (incl. Houma), and the Strait of
-# Juan de Fuca / Puget Sound. Cells not present in a given build's ENC zip
-# are silently skipped at runtime.
+#
+# Background: NOAA's legacy ENCs were compiled cell-by-cell from paper
+# sources over decades, each cell drawn at a fixed scale. The result is
+# real discontinuities in the lower-band overview cells: some coastal
+# areas have band 3+ detail cells but no band 2 (z=9-10) cell — and a
+# few stretches are missing both band 2 AND band 3, with detail only
+# starting at band 4 or band 5.
+#
+# NOAA acknowledges this and is rebuilding the entire ENC catalog as a
+# continuous gridded dataset under the ENC Rescheming Project. The
+# rescheming order is band 5 (harbour) first, then 4, 3, 2, 1 — so
+# band 2 (where most of these holes live) is one of the last bands to
+# be completed. As reschemed cells are published, entries below can
+# safely be removed.
+#
+# References:
+#   • Rescheming program:
+#     https://nauticalcharts.noaa.gov/charts/rescheming-and-improving-electronic-navigational-charts.html
+#   • Design handbook (calls out band-4 discontinuity examples):
+#     https://nauticalcharts.noaa.gov/publications/docs/enc-design-handbook.pdf
+#   • Live cell-creation status map viewer:
+#     https://nauticalcharts.noaa.gov/updates/follow-the-status-of-electronic-navigational-chart-improvements-with-noaas-new-map-viewer/
+#
+# How this works at runtime:
+#   For each group below, s57-to-mbtiles.py (process_gap_fill) takes the
+#   named cells' already-exported GeoJSON and runs an extra tippecanoe
+#   pass at the group's zoom_range. Each fill mbtiles is slotted into
+#   the final tile-join between band 2 and band 3, so the original-band
+#   tippecanoe outputs still win where they have data; the fill only
+#   appears where the original bands are empty. Cells listed below but
+#   not present in the build's ENC zip are silently skipped — so this
+#   list is a global superset, not per-build.
+#
+# Adding a new gap:
+#   1. Find a coverage hole at low zoom (typically z=9-10).
+#   2. Identify higher-band cells (US3…, US4…, or US5…) covering the hole.
+#   3. Verify those cells are actually in the relevant bundle's zip.
+#   4. Add a new group with `zoom_range` covering every missing-band
+#      zoom (e.g. [9,12] if bands 2 and 3 are both missing, [9,14] if
+#      bands 2/3/4 are all missing).
+#
+# Schema:
+#   gap_fills:
+#     - name: <stable identifier, used in mbtiles filename>
+#       description: <optional, free text>
+#       zoom_range: [minzoom, maxzoom]
+#       cells: [<US-prefixed cell IDs>]
 
 gap_fills:
-  zoom_range: [9, 10]
-  cells:
-    # Texas Gulf coast (Brownsville → LA border)
-    - US3TX1AA
-    - US3TX1AB
-    - US3TX1AC
-    - US3TX1AD
-    - US3TX1BA
-    - US3TX1BB
-    - US3TX1BC
-    - US3TX1BD
-    - US3TX1CA
-    - US3TX1CB
-    - US3TX1CC
-    - US3TX1CD
+  - name: gulf_pnw_band2_holes
+    description: >
+      Band 2 (z=9-10) holes filled with band 3 detail cells.
+      South Texas (Brownsville → Matagorda), Louisiana (Morgan City →
+      Grand Isle, including Houma), and the Strait of Juan de Fuca /
+      Puget Sound — all areas where the band 2 catalog cells exist but
+      their polygons leave a gap, or where no band 2 cell exists at all.
+    zoom_range: [9, 10]
+    cells:
+      # Texas Gulf coast (Brownsville → LA border)
+      - US3TX1AA
+      - US3TX1AB
+      - US3TX1AC
+      - US3TX1AD
+      - US3TX1BA
+      - US3TX1BB
+      - US3TX1BC
+      - US3TX1BD
+      - US3TX1CA
+      - US3TX1CB
+      - US3TX1CC
+      - US3TX1CD
 
-    # Louisiana coast + offshore (Morgan City → Grand Isle, incl. Houma)
-    - US3LA1AA
-    - US3LA1AB
-    - US3LA1AC
-    - US3LA1BA
-    - US3LA1BB
-    - US3LA1BC
-    - US3LA1CC
-    - US3LA1DC
+      # Louisiana coast + offshore (Morgan City → Grand Isle, incl. Houma)
+      - US3LA1AA
+      - US3LA1AB
+      - US3LA1AC
+      - US3LA1BA
+      - US3LA1BB
+      - US3LA1BC
+      - US3LA1CC
+      - US3LA1DC
 
-    # Pacific Northwest (Strait of Juan de Fuca / Puget Sound)
-    - US3WA1EE
-    - US3WA1EF
-    - US3WA1EG
+      # Pacific Northwest (Strait of Juan de Fuca / Puget Sound)
+      - US3WA1EE
+      - US3WA1EF
+      - US3WA1EG
+
+  - name: east_maine_band23_holes
+    description: >
+      Downeast Maine, Mount Desert through Schoodic to ~-67.20°W. Both
+      band 2 (US2EC03M / US2EC04M) and band 3 (US3EC11M) catalog cells
+      exist but their polygons stop at -68.50°W along 44.83°N — they
+      don't reach the eastern Maine coast. Filled with band 4 cells at
+      z=9-12 to cover both missing bands.
+    zoom_range: [9, 12]
+    cells:
+      - US4ME1CJ
+      - US4ME1CK
+      - US4ME1DJ
+      - US4ME1DK
+      - US4ME1DL
+      - US4ME1DM
+      - US4ME1EJ
+      - US4ME1EK
+      - US4ME1EL
+      - US4ME1EM
+      - US4ME1FM
+
+  - name: east_maine_lubec_eastport
+    description: >
+      Easternmost US Maine — Cutler / Lubec / Eastport / Cobscook Bay,
+      -67.20°W to the Canadian border at ~-66.90°W. Bands 2, 3, AND 4
+      are all missing in NOAA's catalog for this stretch; only band 5
+      and a single band 6 cell exist. Filled with band 5 cells at z=9-14
+      so something renders at overview/coastal/approach zooms. Visually
+      busy because harbour-scale features (soundings, lights) appear at
+      low zoom, but better than empty water.
+    zoom_range: [9, 14]
+    cells:
+      - US5ME3FE
+      - US5ME3FF
+      - US5ME3FG
+      - US5ME3FH
+      - US5ME3GE
+      - US5ME3GF
+      - US5ME3GG
+      - US5ME3GH
+      - US5ME3HE
+      - US5ME3HF
+      - US5ME3HG
+      - US5ME3HH
 
 # ─── Active builds ─────────────────────────────────────────────────────
 # Only these run when the workflow triggers.
