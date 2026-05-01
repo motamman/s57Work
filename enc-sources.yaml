@@ -285,12 +285,14 @@ builds:
 gap_fills:
   - name: gulf_pnw_band2_holes
     description: >
-      Band 2 (z=9-10) holes filled with band 3 detail cells.
-      South Texas (Brownsville → Matagorda), Louisiana (Morgan City →
-      Grand Isle, including Houma), and the Strait of Juan de Fuca /
-      Puget Sound — all areas where the band 2 catalog cells exist but
-      their polygons leave a gap, or where no band 2 cell exists at all.
-    zoom_range: [9, 10]
+      Coastal areas where NOAA's lower-band cells leave gaps. Filled at
+      every zoom z=9-16 with band 3 detail cells. tile-join lets the
+      original higher-band outputs win where they have data, so this
+      fill only shows up in tiles the natural pipeline left empty.
+      Affected areas: South Texas (Brownsville → Matagorda), Louisiana
+      (Morgan City → Grand Isle, incl. Houma), Strait of Juan de Fuca /
+      Puget Sound.
+    zoom_range: [9, 16]
     cells:
       # Texas Gulf coast (Brownsville → LA border)
       - US3TX1AA
@@ -321,14 +323,35 @@ gap_fills:
       - US3WA1EF
       - US3WA1EG
 
-  - name: east_maine_band23_holes
+  - name: east_maine_offshore_band3
     description: >
-      Downeast Maine, Mount Desert through Schoodic to ~-67.20°W. Both
-      band 2 (US2EC03M / US2EC04M) and band 3 (US3EC11M) catalog cells
-      exist but their polygons stop at -68.50°W along 44.83°N — they
-      don't reach the eastern Maine coast. Filled with band 4 cells at
-      z=9-12 to cover both missing bands.
-    zoom_range: [9, 12]
+      US3EC11M is the band 3 offshore cell covering the Gulf of Maine
+      east of Mount Desert. It naturally renders only at z=11-12, but no
+      band 4 cell exists for the lat 44.75-44.80 strip — leaving holes
+      at z=13-16 in this offshore corridor. Filled at all zooms 9-16.
+    zoom_range: [9, 16]
+    cells:
+      - US3EC11M
+
+  - name: east_maine_band2345_holes
+    description: >
+      Downeast Maine, Mount Desert through Schoodic to ~-67.20°W.
+      Multiple bands missing in this strip:
+        • Bands 2 (US2EC03M / US2EC04M) and 3 (US3EC11M) catalog cells
+          exist but their polygons stop at -68.50°W along 44.83°N, so
+          they don't reach the eastern Maine coast at all.
+        • Band 5 cells exist only around Mount Desert (US5ME2*) and
+          around Lubec/Eastport (US5ME3*) — the 50-mile strip between
+          them (Petit Manan → Cutler, including Milbridge, Jonesport,
+          Roque Bluffs, Machias) has NO band 5 cells in NOAA's catalog.
+      Filled with band 4 cells across all zooms 9-16. At z=13-14 the
+      normal band 4 processing renders the cells; at z=9-12 and z=15-16
+      this gap-fill pass puts them into the missing bands' zoom ranges.
+      Where band 5 cells exist (Mount Desert, Lubec) the normal band 5
+      output still wins via tile-join. Visual tradeoff: at z=15-16 the
+      Petit Manan→Cutler strip shows 1:22,000-scale features rendered
+      at ~1:8,000 zoom — coarser than ideal but better than empty.
+    zoom_range: [9, 16]
     cells:
       - US4ME1CJ
       - US4ME1CK
@@ -347,11 +370,11 @@ gap_fills:
       Easternmost US Maine — Cutler / Lubec / Eastport / Cobscook Bay,
       -67.20°W to the Canadian border at ~-66.90°W. Bands 2, 3, AND 4
       are all missing in NOAA's catalog for this stretch; only band 5
-      and a single band 6 cell exist. Filled with band 5 cells at z=9-14
-      so something renders at overview/coastal/approach zooms. Visually
-      busy because harbour-scale features (soundings, lights) appear at
-      low zoom, but better than empty water.
-    zoom_range: [9, 14]
+      cells exist. Filled with band 5 cells at all zooms 9-16 so they
+      render across overview/coastal/approach zooms too. Where the band
+      5 natural pipeline runs (z=15-16), it produces the same data, and
+      tile-join handles the overlap.
+    zoom_range: [9, 16]
     cells:
       - US5ME3FE
       - US5ME3FF
