@@ -186,7 +186,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: success()
+    # Run even if some matrix builds failed — release whatever succeeded.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     permissions:
       contents: write
     steps:
@@ -201,25 +202,49 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f)
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
+          if [ -z "$files" ]; then
+            echo "No successful builds produced artifacts — nothing to release."
+            exit 1
+          fi
           echo "Files for release:"
           ls -lh $files
 
-          if gh release view "latest" >/dev/null 2>&1; then
-            echo "Updating existing 'latest' release in place..."
-            # --clobber replaces same-named assets; assets from regions that
-            # weren't rebuilt this run are preserved.
-            gh release upload "latest" --clobber $files
-            gh release edit "latest" \
-              --notes "Automated ENC chart build from NOAA S-57 data. Last update: $DATE."
-          else
+          NOTES="Automated ENC chart build from NOAA S-57 data. Last update: $DATE."
+          if ! gh release view "latest" >/dev/null 2>&1; then
             echo "Creating new 'latest' release..."
-            gh release create "latest" \
-              --title "ENC Charts" \
-              --notes "Automated ENC chart build from NOAA S-57 data. Last update: $DATE." \
-              --latest \
-              $files
+            gh release create "latest" --title "ENC Charts" --notes "$NOTES" --latest
           fi
+
+          # Upload one file at a time so a single oversized or failed asset
+          # can't abort the rest of the batch. --clobber replaces same-named
+          # assets; assets from regions not rebuilt this run are preserved.
+          MAX_ASSET_SIZE=2147483648  # GitHub hard limit: 2 GiB per release asset
+          skipped=""
+          failed=""
+          for f in $files; do
+            size=$(stat -c%s "$f")
+            if [ "$size" -ge "$MAX_ASSET_SIZE" ]; then
+              echo "::warning::Skipping $f ($(numfmt --to=iec $size)) — exceeds GitHub's 2 GiB release asset limit"
+              skipped="$skipped $f"
+              continue
+            fi
+            echo "Uploading $f ($(numfmt --to=iec $size))..."
+            if ! gh release upload "latest" --clobber "$f"; then
+              echo "::warning::Upload failed for $f"
+              failed="$failed $f"
+            fi
+          done
+
+          gh release edit "latest" --notes "$NOTES"
 
           echo "Current assets in 'latest':"
           gh release view "latest" --json assets --jq '.assets[].name'
+
+          if [ -n "$skipped" ]; then
+            echo "Skipped (over 2 GiB):$skipped"
+          fi
+          if [ -n "$failed" ]; then
+            echo "Failed uploads:$failed"
+            exit 1
+          fi
