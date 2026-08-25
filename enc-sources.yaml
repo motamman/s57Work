@@ -402,7 +402,7 @@ active:
   - 11cgd
   - 13cgd
   - 14cgd
-  # 17cgd (Alaska) disabled: output is 2.3 GB, over GitHub's 2 GiB
-  # release asset limit — needs splitting before it can be released.
-  # - 17cgd
+  # 17cgd oversized outputs go to R2 (no size limit); GitHub release
+  # assets are skipped automatically for files over 2 GiB.
+  - 17cgd
   
