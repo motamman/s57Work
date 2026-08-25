@@ -309,6 +309,13 @@ jobs:
           BUCKET="${BUCKET%/}"  # tolerate a trailing slash in the secret
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           PUB="${R2_PUBLIC_URL%/}"
+          # R2_BUCKET may include an in-bucket folder ("bucket/folder");
+          # the public host serves from the bucket root, so append that
+          # folder to the link base here. R2_PUBLIC_URL never needs to
+          # be anything but the bare public hostname.
+          case "$BUCKET" in
+            */*) PUB="$PUB/${BUCKET#*/}" ;;
+          esac
           MAX_ASSET_SIZE=2147483648
 
           {
