@@ -83,7 +83,7 @@ builds:
     sources:
       - NH_ENCs.zip
 
- no:
+  ma:
     mode: by-band
     sources:
       - MA_ENCs.zip
