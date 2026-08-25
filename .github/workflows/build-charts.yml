@@ -269,6 +269,7 @@ jobs:
           ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
+          BUCKET="${BUCKET%/}"  # tolerate a trailing slash in the secret
           files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
           failed=""
           for f in $files; do
@@ -305,6 +306,7 @@ jobs:
           ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
+          BUCKET="${BUCKET%/}"  # tolerate a trailing slash in the secret
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           PUB="${R2_PUBLIC_URL%/}"
           MAX_ASSET_SIZE=2147483648
