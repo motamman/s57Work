@@ -42,7 +42,7 @@ All artifacts stored in `./data/` and preserved between runs for resume capabili
 
 ## Key Design Decisions
 
-- **By-band mode** groups charts by NOAA usage band (1-6), not by state. Each band starts at its native minzoom (e.g., band 5 = harbour = z15) but renders all the way up to the global maxzoom, so the best available band fills deep zooms wherever finer bands have no coverage; tile-join's coarse→fine order lets finer bands win on overlap. Native ranges are in the `BAND_ZOOM` dict at the top of the file.
+- **By-band mode** groups charts by NOAA usage band (1-6), not by state. Each band starts at its native minzoom and renders `BAND_ZOOM_EXTENSION` (=2) zoom levels past its native ceiling, capped at the global maxzoom — so band 4 (native z13-14) reaches z16, filling deep zooms along the whole charted coast, while ocean-basin overview bands stop early (rendering band 1 to z16 blew CI time and disk on Pacific districts). tile-join's coarse→fine order lets finer bands win on overlap. Native ranges are in the `BAND_ZOOM` dict at the top of the file.
 - **Resume-friendly**: tippecanoe skips zoom levels where a non-empty `.mbtiles` already exists; GDAL export skips if GeoJSON already exists in the band directory.
 - **Skipped layers**: `DSID`, `C_AGGR`, `C_ASSO`, `Generic` are metadata-only and excluded from GDAL export.
 - **Layer naming**: GeoJSON filenames like `DEPARE_US5MA1SK.geojson` — tippecanoe layer name comes from the part before the first underscore.

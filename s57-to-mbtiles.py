@@ -70,6 +70,11 @@ BAND_ZOOM: Dict[int, Tuple[int, int, str, str]] = {
     6: (17, 18, "berthing",  "~1:3,000"),
 }
 
+# How many zoom levels past its native ceiling each band renders (capped
+# at the global maxzoom). See the comment at the effective_max computation
+# in process_by_band for the rationale and cost history.
+BAND_ZOOM_EXTENSION = 2
+
 # Per-layer minzoom offset (in zoom levels) from a band's NATIVE minzoom.
 # Layers not listed default to 0 (emit from band's bottom zoom).
 # Heavy/dense layers get +1 so they only appear at the top of the band.
@@ -1063,8 +1068,10 @@ def process_by_band(
         skipped = ""
         if zoom_min is not None and zoom_min > maxzoom:
             skipped = "  <- starts above max zoom, skipping"
+        render_max = (min(zoom_max + BAND_ZOOM_EXTENSION, maxzoom)
+                      if zoom_max is not None else maxzoom)
         print(f"  Band {band} ({desc}, {scale}): {len(by_band[band])} file(s)"
-              f"  z{zoom_min}-{zoom_max} (renders to z{maxzoom}){skipped}")
+              f"  z{zoom_min}-{zoom_max} (renders to z{render_max}){skipped}")
 
     # Build list of bands to process
     band_tasks = []
@@ -1073,14 +1080,18 @@ def process_by_band(
             continue
         zoom_min, zoom_max, desc, scale = BAND_ZOOM[band]
         effective_min = max(zoom_min, minzoom)
-        # Every band renders up to the global maxzoom, not just its native
-        # ceiling: wherever no finer band exists, these tiles are the best
-        # available chart at deep zooms. tile-join (coarse→fine order)
-        # still lets finer bands win on overlap, so harbour charts show
-        # where they exist. Bands whose native range starts above maxzoom
-        # (band 6 berthing at the default z16) still drop out via the
-        # effective_min check.
-        effective_max = maxzoom
+        # Each band renders BAND_ZOOM_EXTENSION levels past its native
+        # ceiling (capped at the global maxzoom): wherever no finer band
+        # exists, its tiles are the best available chart at deeper zooms,
+        # and tile-join (coarse→fine order) lets finer bands win on
+        # overlap. Band 4 (native z14) thus reaches z16, closing the
+        # no-harbour-chart blanks along the whole charted coast. The cap
+        # exists because extending without limit is intractable: overview
+        # bands cover entire ocean basins, and rendering them to z16
+        # multiplied district builds 4-6x in size and blew the 6h CI
+        # timeout / runner disk on Pacific districts (band 1 of 14CGD at
+        # z16 = tiling the whole Pacific EEZ at harbour zoom).
+        effective_max = min(zoom_max + BAND_ZOOM_EXTENSION, maxzoom)
         if effective_min > effective_max:
             continue
         band_tasks.append((band, by_band[band], effective_min, effective_max,
