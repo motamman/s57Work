@@ -190,6 +190,9 @@ jobs:
     if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     permissions:
       contents: write
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -248,3 +251,81 @@ jobs:
             echo "Failed uploads:$failed"
             exit 1
           fi
+
+      # Mirror every chart file to Cloudflare R2, which has no per-file
+      # size limit — oversized charts (e.g. Alaska) land here even when
+      # the GitHub release step had to skip them. Runs only when the R2
+      # secrets are configured; otherwise skipped silently.
+      - name: Upload to Cloudflare R2
+        if: ${{ env.R2_ACCOUNT_ID != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 predates the newer AWS SDK checksum defaults; only send
+          # checksums when an operation strictly requires them.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
+          failed=""
+          for f in $files; do
+            name=$(basename "$f")
+            echo "R2: uploading $name ($(numfmt --to=iec $(stat -c%s "$f")))..."
+            if ! aws s3 cp --endpoint-url "$ENDPOINT" --no-progress \
+                "$f" "s3://$BUCKET/charts/$name"; then
+              echo "::warning::R2 upload failed for $name"
+              failed="$failed $name"
+            fi
+          done
+          echo "Objects now in R2:"
+          aws s3 ls --endpoint-url "$ENDPOINT" "s3://$BUCKET/charts/" || true
+          if [ -n "$failed" ]; then
+            echo "Failed R2 uploads:$failed"
+            exit 1
+          fi
+
+      # Rewrite the release notes with download links to the R2 copies —
+      # listing the whole bucket, not just this run's files, so charts
+      # from earlier runs stay linked. Files over GitHub's 2 GiB asset
+      # limit are flagged as R2-only. Needs R2_PUBLIC_URL (the bucket's
+      # r2.dev URL or custom domain); without it the notes stay plain.
+      - name: Link R2 downloads from release notes
+        if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_PUBLIC_URL != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PUB="${R2_PUBLIC_URL%/}"
+          MAX_ASSET_SIZE=2147483648
+
+          {
+            echo "Automated ENC chart build from NOAA S-57 data. Last update: $DATE."
+            echo
+            echo "### All charts on R2 (no size limit)"
+            echo
+            aws s3 ls --endpoint-url "$ENDPOINT" "s3://$BUCKET/charts/" \
+              | awk '$4 ~ /\.mbtiles$/ {print $3, $4}' | sort -k2 \
+              | while read -r size name; do
+                  note=""
+                  if [ "$size" -ge "$MAX_ASSET_SIZE" ]; then
+                    note=" *(R2 only — exceeds GitHub's 2 GiB asset limit)*"
+                  fi
+                  echo "- [$name]($PUB/charts/$name) ($(numfmt --to=iec "$size")B)$note"
+                done
+            echo
+            echo "Per-chart metadata: same URLs with \`.json\` instead of \`.mbtiles\`."
+          } > notes.md
+
+          cat notes.md
+          gh release edit "latest" --notes-file notes.md

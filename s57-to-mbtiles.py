@@ -70,9 +70,17 @@ BAND_ZOOM: Dict[int, Tuple[int, int, str, str]] = {
     6: (17, 18, "berthing",  "~1:3,000"),
 }
 
-# Per-layer minzoom offset (in zoom levels) from a band's minzoom.
+# Per-layer minzoom offset (in zoom levels) from a band's NATIVE minzoom.
 # Layers not listed default to 0 (emit from band's bottom zoom).
 # Heavy/dense layers get +1 so they only appear at the top of the band.
+#
+# Enforcement: tippecanoe silently IGNORES a per-layer "minzoom" in the
+# -L JSON layer spec (verified against v2.78.0), so these offsets are
+# applied by stamping the feature-level `tippecanoe.minzoom` extension
+# onto each feature during consolidation (merge_geojson_layer), which
+# tippecanoe does honor. Applies in by-band mode and gap fills; plain
+# single-source mode has no band context and emits all layers from its
+# bottom zoom.
 LAYER_MIN_ZOOM_OFFSET: Dict[str, int] = {
     # Aids to navigation — only meaningful at approach detail or finer
     "LIGHTS": 1,
@@ -346,6 +354,20 @@ def output_is_fresh(output: Path, inputs: List[Path]) -> bool:
     return True
 
 
+def _mbtiles_zoom_range(path: Path) -> Optional[Tuple[int, int]]:
+    """(minzoom, maxzoom) from an mbtiles' metadata, or None if unreadable.
+    Used so a zoom-range change invalidates otherwise-fresh outputs."""
+    try:
+        db = sqlite3.connect(path)
+        meta = dict(db.execute(
+            "SELECT name, value FROM metadata "
+            "WHERE name IN ('minzoom', 'maxzoom')").fetchall())
+        db.close()
+        return int(meta["minzoom"]), int(meta["maxzoom"])
+    except Exception:
+        return None
+
+
 def cell_outputs_fresh(enc_path: Path, geojson_dir: Path,
                        multi_file: bool) -> bool:
     """True if all GeoJSON outputs for this cell are newer than every source
@@ -558,9 +580,14 @@ echo "Export complete"
 # ---------------------------------------------------------------------------
 
 def merge_geojson_layer(layer_name: str, source_files: List[Path],
-                        output_path: Path):
+                        output_path: Path,
+                        stamp_minzoom: Optional[int] = None):
     """Merge multiple GeoJSON files into one valid FeatureCollection.
-    Uses streaming writes to keep memory low."""
+    Uses streaming writes to keep memory low.
+
+    When stamp_minzoom is set, each feature gets the tippecanoe feature
+    extension {"minzoom": N}, which tippecanoe honors natively — unlike
+    per-layer "minzoom" in the -L JSON spec, which it silently ignores."""
     with open(output_path, "w") as out:
         out.write('{"type":"FeatureCollection","features":[\n')
         first = True
@@ -571,6 +598,11 @@ def merge_geojson_layer(layer_name: str, source_files: List[Path],
             except (json.JSONDecodeError, OSError):
                 continue
             for feat in fc.get("features", []):
+                if stamp_minzoom is not None and isinstance(feat, dict):
+                    ext = feat.get("tippecanoe")
+                    ext = dict(ext) if isinstance(ext, dict) else {}
+                    ext["minzoom"] = stamp_minzoom
+                    feat["tippecanoe"] = ext
                 if not first:
                     out.write(",\n")
                 json.dump(feat, out)
@@ -578,10 +610,32 @@ def merge_geojson_layer(layer_name: str, source_files: List[Path],
         out.write("\n]}\n")
 
 
+def _stamp_marker_stale(merged_dir: Path,
+                        layer_minzoom: Optional[Dict[str, int]]) -> bool:
+    """Freshness guard for per-feature minzoom stamps baked into merged
+    GeoJSON: mtime checks can't see stamp-config changes, so the applied
+    config is recorded in a marker file. Returns True (treat all merged
+    files as stale) when the config differs from what's recorded, and
+    updates the marker."""
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    marker = merged_dir / ".layer-minzoom.json"
+    current = json.dumps(layer_minzoom or {}, sort_keys=True)
+    try:
+        if marker.exists() and marker.read_text() == current:
+            return False
+    except OSError:
+        pass
+    marker.write_text(current)
+    return True
+
+
 def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
-                        max_workers: int = 1) -> List[Path]:
+                        max_workers: int = 1,
+                        layer_minzoom: Optional[Dict[str, int]] = None
+                        ) -> List[Path]:
     """Group geojson files by layer name and merge into one file per layer.
-    Returns list of merged file paths."""
+    Returns list of merged file paths. layer_minzoom maps layer name →
+    absolute minzoom to stamp per-feature (see LAYER_MIN_ZOOM_OFFSET)."""
     merged_dir.mkdir(parents=True, exist_ok=True)
 
     geojson_files = [f for f in sorted(geojson_dir.glob("*.geojson"))
@@ -595,12 +649,13 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
         layer_name = f.stem.split("_")[0] if "_" in f.stem else f.stem
         layer_groups.setdefault(layer_name, []).append(f)
 
-    # Per-layer freshness pre-pass
+    # Per-layer freshness pre-pass (all stale if the stamp config changed)
+    force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
     fresh: List[Path] = []
     stale: List[Tuple[str, List[Path], Path]] = []
     for layer_name, files in layer_groups.items():
         out_path = merged_dir / f"{layer_name}.geojson"
-        if output_is_fresh(out_path, files):
+        if not force_stale and output_is_fresh(out_path, files):
             fresh.append(out_path)
         else:
             stale.append((layer_name, files, out_path))
@@ -614,10 +669,12 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
 
     def merge_one(item):
         layer_name, files, out_path = item
-        if len(files) == 1:
+        stamp = (layer_minzoom or {}).get(layer_name)
+        if len(files) == 1 and stamp is None:
             shutil.copy2(files[0], out_path)
         else:
-            merge_geojson_layer(layer_name, files, out_path)
+            merge_geojson_layer(layer_name, files, out_path,
+                                stamp_minzoom=stamp)
         return out_path
 
     if max_workers <= 1:
@@ -663,18 +720,19 @@ def run_tippecanoe_for_source(
 
     final = tile_dir / f"{stem}.mbtiles"
 
-    if output_is_fresh(final, merged_files):
+    if (output_is_fresh(final, merged_files)
+            and _mbtiles_zoom_range(final) == (minzoom, maxzoom)):
         print(f"  [{stem}] z{minzoom}-{maxzoom}: fresh "
               f"({final.stat().st_size / 1048576:.1f} MB), skipping")
         return final
 
-    # Build per-layer JSON layer specs with per-layer minzoom
+    # Build per-layer JSON layer specs. A per-layer "minzoom" here would
+    # be silently ignored by tippecanoe (verified v2.78.0) — zoom gating
+    # for heavy layers is instead stamped per-feature during consolidation
+    # via the `tippecanoe.minzoom` extension (see LAYER_MIN_ZOOM_OFFSET).
     layer_args = []
     for f in merged_files:
-        layer_name = f.stem
-        layer_min = min(minzoom + LAYER_MIN_ZOOM_OFFSET.get(layer_name, 0),
-                        maxzoom)
-        spec = {"file": str(f), "layer": layer_name, "minzoom": layer_min}
+        spec = {"file": str(f), "layer": f.stem}
         layer_args.extend(["-L", json.dumps(spec)])
 
     print(f"tippecanoe [{stem}]: {len(merged_files)} layers, "
@@ -872,14 +930,22 @@ def _process_gap_fill_group(
     merged_dir = data_dir / "merged" / f"gapfill-{safe_name}"
     merged_dir.mkdir(parents=True, exist_ok=True)
 
+    # Heavy-layer minzoom stamps, offset from the group's configured
+    # bottom zoom (config-static, so cached merges stay valid).
+    layer_minzoom = {name: group.zoom_range[0] + off
+                     for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
+    force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
+
     for layer_name, files in layer_groups.items():
         out_path = merged_dir / f"{layer_name}.geojson"
-        if output_is_fresh(out_path, files):
+        if not force_stale and output_is_fresh(out_path, files):
             continue
-        if len(files) == 1:
+        stamp = layer_minzoom.get(layer_name)
+        if len(files) == 1 and stamp is None:
             shutil.copy2(files[0], out_path)
         else:
-            merge_geojson_layer(layer_name, files, out_path)
+            merge_geojson_layer(layer_name, files, out_path,
+                                stamp_minzoom=stamp)
 
     tile_dir = data_dir / "tiles"
     return run_tippecanoe_for_source(
@@ -937,9 +1003,15 @@ def process_band(
         band_enc_dir, band_geojson_dir, band_cells, label=label,
         native_gdal=native_gdal, runtime=runtime, max_workers=max_workers)
 
-    # Stage 3: Consolidate
+    # Stage 3: Consolidate. Heavy layers get a per-feature minzoom stamp,
+    # offset from the band's NATIVE minzoom (not the CLI-effective one) so
+    # cached merged files stay valid across zoom-argument changes.
+    band_zoom_min = BAND_ZOOM[band][0]
+    layer_minzoom = {name: band_zoom_min + off
+                     for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
     consolidate_geojson(band_geojson_dir, band_merged_dir,
-                        max_workers=max_workers)
+                        max_workers=max_workers,
+                        layer_minzoom=layer_minzoom)
 
     # Stage 4: one tippecanoe for the band
     return run_tippecanoe_for_source(
@@ -989,10 +1061,10 @@ def process_by_band(
         zoom_min, zoom_max, desc, scale = BAND_ZOOM.get(
             band, (None, None, "unknown", "?"))
         skipped = ""
-        if zoom_min is not None and (zoom_max < minzoom or zoom_min > maxzoom):
-            skipped = "  <- outside zoom range, skipping"
+        if zoom_min is not None and zoom_min > maxzoom:
+            skipped = "  <- starts above max zoom, skipping"
         print(f"  Band {band} ({desc}, {scale}): {len(by_band[band])} file(s)"
-              f"  z{zoom_min}-{zoom_max}{skipped}")
+              f"  z{zoom_min}-{zoom_max} (renders to z{maxzoom}){skipped}")
 
     # Build list of bands to process
     band_tasks = []
@@ -1001,7 +1073,14 @@ def process_by_band(
             continue
         zoom_min, zoom_max, desc, scale = BAND_ZOOM[band]
         effective_min = max(zoom_min, minzoom)
-        effective_max = min(zoom_max, maxzoom)
+        # Every band renders up to the global maxzoom, not just its native
+        # ceiling: wherever no finer band exists, these tiles are the best
+        # available chart at deep zooms. tile-join (coarse→fine order)
+        # still lets finer bands win on overlap, so harbour charts show
+        # where they exist. Bands whose native range starts above maxzoom
+        # (band 6 berthing at the default z16) still drop out via the
+        # effective_min check.
+        effective_max = maxzoom
         if effective_min > effective_max:
             continue
         band_tasks.append((band, by_band[band], effective_min, effective_max,
