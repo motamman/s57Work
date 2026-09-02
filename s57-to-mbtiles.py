@@ -797,10 +797,12 @@ def _patch_metadata(mbtiles_path: Path, name: str):
 # The district's regional extent is defined as the union of its own
 # band>=3 (coastal/approach/harbour) chart footprints — never band 1/2 —
 # rasterized as a tile mask at REGION_MASK_ZOOM and dilated by one tile
-# for margin at the edges. After the per-band tippecanoe runs, tiles in
-# band 1/2 files falling outside the mask are deleted and those files'
-# bounds metadata recomputed from surviving tiles, so tile-join produces
-# a final file whose tile pyramid AND declared bounds are regional. This
+# for margin at the edges. After the per-band tippecanoe runs, each band
+# 1/2 file is copied to a derived *.region.mbtiles, tiles outside the
+# mask are deleted from the copy and its bounds metadata recomputed from
+# the survivors, and tile-join consumes the copy — so the final file's
+# tile pyramid AND declared bounds are regional while the cached
+# tippecanoe outputs stay pristine for resume. This
 # naturally keeps multi-part regions (14CGD = Hawaii + Guam + Samoa)
 # because the mask is a tile set, not a single bbox.
 
@@ -823,34 +825,44 @@ def _tile_lonlat_bounds(z: int, x: int, tms_y: int
     return w, lat(y + 1), e, lat(y)
 
 
-def _tile_coords(db: sqlite3.Connection) -> List[Tuple[int, int, int]]:
-    """All (zoom, column, row) in an mbtiles, via map table or tiles."""
+def _tile_table(db: sqlite3.Connection) -> str:
+    """Name of the table holding tile addresses: tippecanoe's normalized
+    `map` table when present, else the plain `tiles` table."""
     has_map = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='map'"
     ).fetchone()
-    src = "map" if has_map else "tiles"
+    return "map" if has_map else "tiles"
+
+
+def _tile_coords(db: sqlite3.Connection) -> List[Tuple[int, int, int]]:
+    """All (zoom, column, row) in an mbtiles, via map table or tiles."""
     return list(db.execute(
-        f"SELECT zoom_level, tile_column, tile_row FROM {src}"))
+        f"SELECT zoom_level, tile_column, tile_row FROM {_tile_table(db)}"))
 
 
 def _region_mask(band_tiles: Dict[int, Path]) -> set:
     """Union of band>=3 tile coverage as (x, y) pairs at REGION_MASK_ZOOM,
     dilated by one tile. TMS rows throughout — ancestor math (right-shift)
-    is row-order-agnostic."""
+    is row-order-agnostic.
+
+    Only each band's bottom-zoom rows are read: coverage at the bottom
+    zoom already spans the band's footprint, and streaming just that level
+    avoids materializing the millions of z16 rows a district's band 4/5
+    files carry."""
     mask: set = set()
     for band in sorted(b for b in band_tiles if b >= 3):
         db = sqlite3.connect(str(band_tiles[band]))
-        coords = _tile_coords(db)
-        db.close()
-        if not coords:
-            continue
-        zmin = min(c[0] for c in coords)
-        if zmin < REGION_MASK_ZOOM:
+        table = _tile_table(db)
+        zmin = db.execute(f"SELECT MIN(zoom_level) FROM {table}").fetchone()[0]
+        if zmin is None or zmin < REGION_MASK_ZOOM:
+            db.close()
             continue
         shift = zmin - REGION_MASK_ZOOM
-        for z, x, y in coords:
-            if z == zmin:
-                mask.add((x >> shift, y >> shift))
+        for x, y in db.execute(
+                f"SELECT DISTINCT tile_column, tile_row FROM {table} "
+                "WHERE zoom_level = ?", (zmin,)):
+            mask.add((x >> shift, y >> shift))
+        db.close()
     # Dilate by one tile (~20 km at z11) so band 1/2 coverage doesn't get
     # shaved right at the region's edge.
     n = 1 << REGION_MASK_ZOOM
@@ -877,34 +889,47 @@ def _recompute_bounds(db: sqlite3.Connection) -> Optional[str]:
     return f"{w},{s},{e},{n}"
 
 
-def trim_low_bands_to_region(band_tiles: Dict[int, Path]) -> None:
-    """Delete band 1/2 tiles outside the district region and fix their
-    bounds metadata. No-op when there's nothing to trim against.
+def trim_low_bands_to_region(band_tiles: Dict[int, Path]
+                             ) -> Dict[int, Path]:
+    """Return the band->mbtiles map to feed tile-join, with band 1/2
+    entries replaced by copies clipped to the district region.
 
-    Mutates band_tiles in place: a band left with no tiles at all is
-    removed from the dict so the empty file never reaches tile-join."""
+    The tippecanoe outputs in band_tiles are never modified: they are the
+    cached build artifacts that the resume logic in
+    run_tippecanoe_for_source relies on, and a clip that deleted rows in
+    place could never be undone when a later run's band>=3 inputs widen
+    the region. Clipping is cheap (band 1/2 files are small), so it is
+    treated like the other cheap stages — always recomputed, into a
+    separate *.region.mbtiles derived file. A low band left with no tiles
+    inside the region is dropped from the returned map. Bands >= 3 pass
+    through untouched. When there is nothing to clip against, the input
+    map is returned unchanged."""
     low = sorted(b for b in band_tiles if b < 3)
     if not low:
-        return
+        return dict(band_tiles)
     if not any(b >= 3 for b in band_tiles):
         print("WARNING: no band>=3 charts to define the district region; "
               "skipping overview-band clipping", file=sys.stderr)
-        return
+        return dict(band_tiles)
 
     mask = _region_mask(band_tiles)
     if not mask:
         print("WARNING: empty district-region mask; skipping clipping",
               file=sys.stderr)
-        return
+        return dict(band_tiles)
 
     # Ancestor masks for zooms coarser than the mask zoom.
     anc: Dict[int, set] = {}
     for d in range(1, REGION_MASK_ZOOM + 1):
         anc[d] = {(x >> d, y >> d) for x, y in mask}
 
+    result = dict(band_tiles)
     for band in low:
-        path = band_tiles[band]
-        db = sqlite3.connect(str(path))
+        src = band_tiles[band]
+        dst = src.with_name(f"{src.stem}.region{src.suffix}")
+        shutil.copy2(src, dst)
+        db = sqlite3.connect(str(dst))
+        table = _tile_table(db)
         doomed = []
         for z, x, y in _tile_coords(db):
             if z >= REGION_MASK_ZOOM:
@@ -914,22 +939,12 @@ def trim_low_bands_to_region(band_tiles: Dict[int, Path]) -> None:
                 keep = (x, y) in anc[REGION_MASK_ZOOM - z]
             if not keep:
                 doomed.append((z, x, y))
-        if not doomed:
-            db.close()
-            continue
-        has_map = db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='map'"
-        ).fetchone()
-        if has_map:
-            db.executemany(
-                "DELETE FROM map WHERE zoom_level=? AND tile_column=? "
-                "AND tile_row=?", doomed)
+        db.executemany(
+            f"DELETE FROM {table} WHERE zoom_level=? AND tile_column=? "
+            "AND tile_row=?", doomed)
+        if table == "map":
             db.execute("DELETE FROM images WHERE tile_id NOT IN "
                        "(SELECT DISTINCT tile_id FROM map)")
-        else:
-            db.executemany(
-                "DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
-                "AND tile_row=?", doomed)
         bounds = _recompute_bounds(db)
         if bounds:
             db.execute("INSERT OR REPLACE INTO metadata (name, value) "
@@ -948,11 +963,13 @@ def trim_low_bands_to_region(band_tiles: Dict[int, Path]) -> None:
         db.close()
         if bounds:
             print(f"  [band{band}] clipped {len(doomed)} out-of-region "
-                  f"tile(s), bounds -> {bounds}")
+                  f"tile(s) -> {dst.name}, bounds -> {bounds}")
+            result[band] = dst
         else:
             print(f"  [band{band}] clipped all {len(doomed)} tile(s) as "
                   f"out-of-region; excluding empty band from merge")
-            del band_tiles[band]
+            del result[band]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1304,7 +1321,7 @@ def process_by_band(
     # Clip band 1/2 output to the district's regional extent (union of
     # its band>=3 footprints) — ocean-basin overview cells otherwise put
     # planet-wide tiles and bounds into every district file.
-    trim_low_bands_to_region(band_tiles)
+    band_tiles = trim_low_bands_to_region(band_tiles)
     if not band_tiles:
         print("ERROR: No tiles left after district-region clipping",
               file=sys.stderr)
