@@ -20,7 +20,7 @@ jobs:
     outputs:
       matrix: ${{ steps.parse.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Parse enc-sources.yaml
         id: parse
@@ -75,7 +75,7 @@ jobs:
         build: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install tippecanoe
         run: |
@@ -174,7 +174,7 @@ jobs:
           print(json.dumps(metadata, indent=2))
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.build.name }}
           path: |
@@ -195,7 +195,7 @@ jobs:
       R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts/
 
