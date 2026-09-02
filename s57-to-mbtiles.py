@@ -879,7 +879,10 @@ def _recompute_bounds(db: sqlite3.Connection) -> Optional[str]:
 
 def trim_low_bands_to_region(band_tiles: Dict[int, Path]) -> None:
     """Delete band 1/2 tiles outside the district region and fix their
-    bounds metadata. No-op when there's nothing to trim against."""
+    bounds metadata. No-op when there's nothing to trim against.
+
+    Mutates band_tiles in place: a band left with no tiles at all is
+    removed from the dict so the empty file never reaches tile-join."""
     low = sorted(b for b in band_tiles if b < 3)
     if not low:
         return
@@ -935,11 +938,21 @@ def trim_low_bands_to_region(band_tiles: Dict[int, Path]) -> None:
             db.execute("INSERT OR REPLACE INTO metadata (name, value) "
                        "VALUES ('center', ?)",
                        (f"{(w + e) / 2},{(s_ + n) / 2},{REGION_MASK_ZOOM}",))
+        else:
+            # Nothing survived: drop the stale (planet-wide) bounds rather
+            # than leave them describing tiles that no longer exist.
+            db.execute("DELETE FROM metadata WHERE name IN "
+                       "('bounds', 'center')")
         db.commit()
         db.execute("VACUUM")
         db.close()
-        print(f"  [band{band}] clipped {len(doomed)} out-of-region tile(s), "
-              f"bounds -> {bounds}")
+        if bounds:
+            print(f"  [band{band}] clipped {len(doomed)} out-of-region "
+                  f"tile(s), bounds -> {bounds}")
+        else:
+            print(f"  [band{band}] clipped all {len(doomed)} tile(s) as "
+                  f"out-of-region; excluding empty band from merge")
+            del band_tiles[band]
 
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1305,10 @@ def process_by_band(
     # its band>=3 footprints) — ocean-basin overview cells otherwise put
     # planet-wide tiles and bounds into every district file.
     trim_low_bands_to_region(band_tiles)
+    if not band_tiles:
+        print("ERROR: No tiles left after district-region clipping",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Gap fill: one mbtiles per configured group. See process_gap_fill()
     # and the `gap_fills:` comment block in enc-sources.yaml for the full
