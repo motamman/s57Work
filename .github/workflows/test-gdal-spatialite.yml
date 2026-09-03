@@ -1,0 +1,44 @@
+name: Test GDAL SpatiaLite erase
+
+# One-off capability probe: does Ubuntu's gdal-bin on a GitHub runner support
+# the SQLite dialect with SpatiaLite (ST_Union / ST_Difference)? This is the
+# polygon-erase step the by-band zoom-extension fix depends on. Manual only.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install GDAL
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdal-bin
+          ogrinfo --version
+          ogrinfo --format SQLite | grep -i spatialite || true
+
+      - name: Erase mask union from features via SpatiaLite scratch DB
+        run: |
+          set -euo pipefail
+          cat > feats.geojson <<'EOF'
+          {"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"coarse_depare","DRVAL1":20},"geometry":{"type":"Polygon","coordinates":[[[-72.5,40.5],[-70.5,40.5],[-70.5,41.8],[-72.5,41.8],[-72.5,40.5]]]}}]}
+          EOF
+          cat > mask.geojson <<'EOF'
+          {"type":"FeatureCollection","features":[{"type":"Feature","properties":{"cell":"A"},"geometry":{"type":"Polygon","coordinates":[[[-72,41],[-71.5,41],[-71.5,41.5],[-72,41.5],[-72,41]]]}},{"type":"Feature","properties":{"cell":"B"},"geometry":{"type":"Polygon","coordinates":[[[-71.6,40.8],[-71,40.8],[-71,41.3],[-71.6,41.3],[-71.6,40.8]]]}}]}
+          EOF
+          ogr2ogr -f SQLite -dsco SPATIALITE=YES scratch.sqlite feats.geojson -nln feats
+          ogr2ogr -update scratch.sqlite mask.geojson -nln mask
+          ogr2ogr -f GeoJSON erased.geojson scratch.sqlite -dialect SQLITE \
+            -sql "SELECT ST_Difference(f.GEOMETRY, (SELECT ST_Union(GEOMETRY) FROM mask)) AS geometry, f.name, f.DRVAL1 FROM feats f"
+          python3 - <<'EOF'
+          import json, sys
+          f = json.load(open("erased.geojson"))["features"][0]
+          g = f["geometry"]
+          print("properties:", f["properties"])
+          print("geometry:", g["type"], "rings:", len(g["coordinates"]))
+          ok = g["type"] == "Polygon" and len(g["coordinates"]) == 2
+          print("ERASE OK" if ok else "ERASE FAILED")
+          print("attribute case preserved:", "DRVAL1" in f["properties"])
+          sys.exit(0 if ok else 1)
+          EOF
