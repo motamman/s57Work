@@ -1,0 +1,16 @@
+[project]
+name = "s57-to-mbtiles"
+version = "0.6.0"
+description = "Convert NOAA S-57 ENC nautical charts (.000) to vector MBTiles for SignalK / Freeboard-SK"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed for the gap_fills: section of enc-sources.yaml
+gapfill = ["pyyaml"]
+
+[project.urls]
+Repository = "https://github.com/motamman/s57Work"
+Changelog = "https://github.com/motamman/s57Work/blob/main/CHANGELOG.md"

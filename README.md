@@ -105,6 +105,8 @@ If `enc-sources.yaml` conflicts on merge, keep your version — it's the one fil
 | 5 | Harbour | z15-16 |
 | 6 | Berthing | z17-18 |
 
+In by-band mode each band also renders two zoom levels past its native ceiling (capped at `--maxzoom`), so wherever no finer chart exists the best available band still fills the deeper zooms. Band 1/2 tiles are then clipped to the district's own region, the union of its band 3+ chart footprints, because ocean-basin overview cells would otherwise put planet-wide tiles and bounds into every district file. The clip is written to a separate `*.region.mbtiles` file in `data/tiles/`; the per-band tippecanoe outputs are left untouched so resume keeps working.
+
 ## Documentation
 
 - [docs/INSTALL.md](docs/INSTALL.md) — Installation guide (macOS, Raspberry Pi)

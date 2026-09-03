@@ -57,6 +57,7 @@ All artifacts stored in `./data/` and preserved between runs for resume capabili
 
 ```
 s57-to-mbtiles.py          # the tool
+pyproject.toml              # project metadata; the version lives here and nowhere else
 enc-sources.yaml            # CI build definitions
 docs/
   INSTALL.md                # platform-specific setup (macOS, Raspberry Pi)

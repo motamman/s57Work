@@ -8,12 +8,14 @@ Convert NOAA S-57 ENC charts (`.000` files) into vector MBTiles for use with Sig
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| **podman** or **docker** | Runs the GDAL container (`ghcr.io/osgeo/gdal:alpine-small-latest`) for ogr2ogr conversions | System package manager |
+| **GDAL** (`ogr2ogr`, `ogrinfo`) | Converts S-57 layers to GeoJSON. Native install is used when found; otherwise the script runs the `ghcr.io/osgeo/gdal:alpine-small-latest` container via **podman** or **docker** | System package manager, or podman/docker |
 | **tippecanoe** | Converts GeoJSON into vector `.mbtiles` tiles | Build from source or package manager |
 | **tile-join** | Merges multiple `.mbtiles` into one (ships with tippecanoe) | Included with tippecanoe |
 | **Python 3** | Runs the script itself | Pre-installed on most systems |
 
-No Python dependencies beyond the standard library.
+No Python dependencies beyond the standard library. `pyyaml` is optional: without it the gap-fill config in `enc-sources.yaml` is skipped with a warning.
+
+See [INSTALL.md](INSTALL.md) for platform-specific setup.
 
 ---
 
@@ -35,19 +37,24 @@ US{band}{region_code}{number}{edition}.000
 - **Region code** (2–3 letters): geographic area (e.g., `MA1`, `CT1`, `NY1`, `BOS`, `PVD`, `EC`)
 - These are **not** always state abbreviations — `BOS` = Boston area, `PVD` = Providence area, `EC` = East Coast regional, `FAV` = Fall River/New Bedford area
 
+Cells may ship with `.001`, `.002`, … update files alongside the `.000` base. The script copies those along with the base so GDAL applies them.
+
 ---
 
 ## Pipeline Overview
 
-For each band or source, the script runs these steps in order:
+For each band or source, the script runs these stages in order:
 
 ```
-1. Extract ZIPs (if input is a ZIP file)
-2. Find all .000 ENC files recursively
-3. ogr2ogr (GDAL, via container) → one GeoJSON file per S-57 layer per ENC file
-4. tippecanoe → one .mbtiles per zoom level
-5. tile-join → merge all zoom-level tiles into one final .mbtiles
+1. Extract    ZIPs / copy directories        → data/enc/
+2. Find       every .000 ENC file recursively
+3. GDAL       ogr2ogr → one GeoJSON per S-57 layer per cell → data/geojson/
+4. Consolidate merge per-cell GeoJSON into one file per layer → data/merged/
+5. tippecanoe one run per band/source over its full zoom range → data/tiles/
+6. tile-join  merge all band/source .mbtiles into the final file
 ```
+
+Every stage checks freshness by file modification time and skips work whose outputs are already newer than their inputs, so re-runs after a partial failure or an added input only redo what changed.
 
 ### Skipped S-57 Layers
 
@@ -62,6 +69,10 @@ The SOUNDG layer gets special handling. S-57 stores soundings as MultiPointZ geo
 - `ADD_SOUNDG_DEPTH=YES` — adds a `DEPTH` property to each feature with the sounding value
 
 This means depth readings show up as a `DEPTH` attribute in the vector tiles, which renderers can display as labels.
+
+### Heavy Layers Start One Zoom Later
+
+In by-band mode and gap fills, dense layers (`SOUNDG`, lights, buoys, beacons, obstructions, wrecks, rocks) are held back one zoom level from their band's bottom zoom, so a band's overview zoom is not swamped with point features. The offsets live in `LAYER_MIN_ZOOM_OFFSET` at the top of the script and are stamped per feature during consolidation. Single-source mode has no band context and emits every layer from its bottom zoom.
 
 ---
 
@@ -112,21 +123,23 @@ python3 s57-to-mbtiles.py CT_ENCs.zip RI_ENCs.zip MA_ENCs.zip NY_ENCs.zip --by-b
 
 How it works:
 
-1. Extracts all ZIPs / copies all directories into a staging area (`all_enc/input0`, `input1`, etc.)
+1. Extracts all ZIPs / copies all directories into a staging area (`data/enc/all/input0`, `input1`, etc.)
 2. Finds every `.000` file recursively
-3. Groups files by NOAA usage band (extracted from the first digit after `US` in the filename)
-4. Runs the full GDAL → tippecanoe pipeline separately for each band, using the correct zoom range:
+3. Groups files by NOAA usage band (the first digit after `US` in the filename)
+4. Runs GDAL → consolidate → tippecanoe separately for each band, bands in parallel. Each band starts at its native minzoom and renders **two zoom levels past its native ceiling**, capped at `--maxzoom`, so wherever no finer chart exists the best available band still fills the deeper zooms:
 
-| Band | Type | Scale | Zoom Range |
-|------|------|-------|------------|
-| 1 | Overview | ~1:3,500,000 | z7–z8 |
-| 2 | General | ~1:700,000 | z9–z10 |
-| 3 | Coastal | ~1:90,000 | z11–z12 |
-| 4 | Approach | ~1:22,000 | z13–z14 |
-| 5 | Harbour | ~1:8,000 | z15–z16 |
-| 6 | Berthing | ~1:3,000 | z17–z18 |
+| Band | Type | Scale | Native zoom | Renders to |
+|------|------|-------|-------------|------------|
+| 1 | Overview | ~1:3,500,000 | z7–z8 | z10 |
+| 2 | General | ~1:700,000 | z9–z10 | z12 |
+| 3 | Coastal | ~1:90,000 | z11–z12 | z14 |
+| 4 | Approach | ~1:22,000 | z13–z14 | z16 |
+| 5 | Harbour | ~1:8,000 | z15–z16 | z16 (default `--maxzoom`) |
+| 6 | Berthing | ~1:3,000 | z17–z18 | needs `--maxzoom 17` or higher |
 
-5. Merges all band tiles with tile-join (coarse bands first, detail wins on overlap)
+5. Clips band 1/2 output to the district's region. Overview cells can span an entire ocean basin (`US1PO02M` covers the whole North Pacific), which would otherwise put planet-wide tiles and −180..180 bounds into every district file. The region is the union of the district's own band 3+ chart footprints as a z11 tile mask, dilated by one tile. The clipped result is written to a separate `bandN-*.region.mbtiles`; the band's tippecanoe output is never modified, so resume stays correct if a later run adds inputs that widen the region.
+6. Builds any gap fills configured in `enc-sources.yaml` (see below).
+7. Merges everything with tile-join, coarse bands first, so detail wins on overlap. Gap fills slot between band 2 and band 3.
 
 **Why by-band is better than per-state:** State boundaries are irrelevant to chart scale. A CT approach chart and a RI approach chart are the same band and belong at the same zoom level. By-band groups them correctly so no source overwrites another.
 
@@ -140,17 +153,23 @@ This skips bands whose zoom range falls entirely outside the requested range, an
 
 Files that don't match the NOAA `US{digit}...` naming convention are reported as warnings and skipped.
 
+#### Gap fills
+
+NOAA's legacy ENC catalog has holes where a stretch of coast has band 3+ detail cells but no band 2 cell, leaving blanks at z9–z12. The `gap_fills:` section of `enc-sources.yaml` lists named groups of higher-band cells to render at a lower zoom range to cover those holes. Cells that are not part of the current build are skipped silently. Each group produces `data/tiles/gapfill-<name>.mbtiles`. The comment block in `enc-sources.yaml` explains the background and how to add a gap.
+
 ### 5. Skip GDAL (reuse existing GeoJSON)
 
-If you already have GeoJSON files (from a previous run's temp directory, for example):
+If you already have GeoJSON files (from a previous run's `data/geojson/`, for example):
 
 ```bash
-python3 s57-to-mbtiles.py --geojson-dir /tmp/s57_xxxx/geojson/ --minzoom 9 --maxzoom 16 -o charts.mbtiles
+python3 s57-to-mbtiles.py --geojson-dir ./data/geojson/band3/ --minzoom 11 --maxzoom 12 -o band3.mbtiles
 ```
 
-- Skips the GDAL container entirely — goes straight to tippecanoe
+- Skips GDAL entirely — goes straight to consolidate and tippecanoe
 - Cannot be combined with `--by-band`
 - The GeoJSON directory must contain `.geojson` files; files under 100 bytes are ignored
+
+In practice the freshness checks make this mode rarely necessary: re-running the same by-band command skips GDAL for every cell whose GeoJSON is already up to date.
 
 ---
 
@@ -162,70 +181,63 @@ python3 s57-to-mbtiles.py --geojson-dir /tmp/s57_xxxx/geojson/ --minzoom 9 --max
 | `--by-band` | Auto-group by NOAA band and assign zoom ranges | off |
 | `--sources FILE:MIN-MAX` | Explicit per-source zoom ranges | — |
 | `--split ZOOM` | Zoom split point for two-input mode | — |
-| `-o, --output` | Output `.mbtiles` filename | auto-generated |
-| `--output-dir` | Directory for output file | `.` (current dir) |
+| `-o, --output` | Output `.mbtiles` filename | `{input_stem}.mbtiles` (`-merged` appended for multiple inputs) |
+| `--output-dir` | Production directory to copy the final `.mbtiles` into. The file always stays in `data/tiles/` as well | no copy |
 | `--minzoom` | Minimum zoom level | 9 |
 | `--maxzoom` | Maximum zoom level | 16 |
 | `--geojson-dir` | Use existing GeoJSON, skip GDAL | — |
-| `--delete-temp` | Remove temp files after completion | off (keeps them) |
+| `-j, --jobs` | Parallel workers for GDAL export, consolidation, and bands | half the CPU count |
 
 ---
 
-## Temp Files
+## Data Directory
 
-By default, the script creates a temp directory at `/tmp/s57_XXXXXXXX/` and **does not delete it**. This is intentional — the GDAL export is the slowest step, and keeping the GeoJSON lets you re-run tippecanoe without redoing GDAL.
+Everything the script produces lives in `./data/` under the current working directory, and **nothing is deleted between runs**. This is intentional — the GDAL export is the slowest step, and keeping its output lets a re-run skip straight to whatever actually changed.
 
-The temp directory structure for `--by-band` mode:
-
-```
-/tmp/s57_XXXXXXXX/
-├── all_enc/           # Staging area for all input ENC files
-│   ├── input0/        # First ZIP/directory extracted here
-│   ├── input1/        # Second ZIP/directory
-│   ├── input2/        # etc.
-│   └── input3/
-├── band2/
-│   ├── enc/           # .000 files for this band (copied from all_enc)
-│   ├── geojson/       # GeoJSON output from ogr2ogr
-│   └── tiles/         # .mbtiles per zoom level from tippecanoe
-├── band3/
-│   ├── enc/
-│   ├── geojson/
-│   └── tiles/
-├── band4/
-│   └── ...
-└── band5/
-    └── ...
-```
-
-For standard (non-by-band) mode:
+Layout for `--by-band` mode:
 
 ```
-/tmp/s57_XXXXXXXX/
-├── source1/
-│   ├── enc/
-│   ├── geojson/
-│   └── tiles/
-└── source2/
-    └── ...
+data/
+├── zips/                       # copy of every input ZIP
+├── enc/
+│   ├── all/input0/, input1/…   # staging: each input extracted here
+│   └── band3/, band4/, …       # .000 (+ .001… updates) copied per band
+├── geojson/
+│   └── band3/, band4/, …       # LAYER_CELL.geojson from ogr2ogr
+├── merged/
+│   ├── band3/, band4/, …       # one LAYER.geojson per band
+│   └── gapfill-<name>/         # per gap-fill group
+└── tiles/
+    ├── band3-coastal.mbtiles   # one file per band (tippecanoe output)
+    ├── band2-general.region.mbtiles  # band 1/2 clipped copies fed to tile-join
+    ├── gapfill-<name>.mbtiles
+    └── <output name>.mbtiles   # final merged file
 ```
 
-Use `--delete-temp` to clean up automatically. Or pass the temp directory path to `--geojson-dir` in a later run to skip GDAL.
+For standard (non-by-band) mode the per-source directories are named after the input file (`data/enc/NY_ENCs.zip/`, `data/geojson/NY_ENCs.zip/`, …) and the tippecanoe outputs are `data/tiles/s1.mbtiles`, `s2.mbtiles`, ….
+
+To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the tippecanoe stage).
+
+### What gets skipped on a re-run
+
+- **GDAL**: a cell is re-exported only if its `.000` or any update file is newer than its existing GeoJSON.
+- **Consolidate**: a merged layer is rebuilt only if any of its per-cell inputs is newer, or the heavy-layer minzoom config changed.
+- **tippecanoe**: a band's `.mbtiles` is reused if it is newer than every merged layer and its stored zoom range matches the requested one.
+- **Clipping, gap-fill merging, tile-join**: cheap, always recomputed.
 
 ---
 
 ## Tippecanoe Behavior
 
-- Runs **one zoom level at a time** (single-zoom `-z Z -Z Z` invocations)
-- Uses `--no-tile-size-limit` and `--no-feature-limit` (nautical charts need all features)
-- If a per-zoom `.mbtiles` already exists in the temp tiles directory and is non-empty, it **skips** that zoom level (resume-friendly)
+- Runs **once per band or source** over its full zoom range (`-Z min -z max`), with every merged layer passed as a separate `-L` layer
+- Uses `--no-tile-size-limit`, `--no-feature-limit`, `--no-simplification`, and `--no-tiny-polygon-reduction` (nautical charts need every feature at full fidelity), plus `--detect-shared-borders` and `--buffer=80`
 - GeoJSON filenames like `DEPARE_US5MA1SK.geojson` get the layer name from the part before the first `_` (so the tile layer is `DEPARE`)
 
 ---
 
 ## Output
 
-The final `.mbtiles` file is a standard MBTiles v1.3 vector tileset. Metadata is patched to set `type=S-57`.
+The final `.mbtiles` file is a standard MBTiles v1.3 vector tileset, written to `data/tiles/<name>.mbtiles` and copied to `--output-dir` if given. Metadata is patched to set `type=S-57` and `name`/`description` to the output stem. In by-band mode the declared bounds reflect the district region, not the full extent of its overview cells.
 
 ### Using with SignalK
 
@@ -258,6 +270,8 @@ Monitor with:
 tail -f ~/s57-rebuild.log
 ```
 
+If a run dies part-way, re-run the same command: the freshness checks pick up where it left off.
+
 ---
 
 ## Common S-57 Layers in Output Tiles
@@ -271,7 +285,7 @@ tail -f ~/s57-rebuild.log
 | COALNE | Coastline |
 | BOYCAR | Cardinal buoys |
 | BOYLAT | Lateral buoys |
-| BCNSPC | Special purpose beacons |
+| BCNSPP | Special purpose beacons |
 | LIGHTS | Lights |
 | NAVLNE | Navigation lines |
 | OBSTRN | Obstructions |
