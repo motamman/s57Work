@@ -2,10 +2,13 @@ name: Test GDAL SpatiaLite erase
 
 # One-off capability probe: does Ubuntu's gdal-bin on a GitHub runner support
 # the SQLite dialect with SpatiaLite (ST_Union / ST_Difference)? This is the
-# polygon-erase step the by-band zoom-extension fix depends on. Manual only.
+# polygon-erase step the by-band zoom-extension fix depends on. Runs on
+# pushes to probe/** branches (manual dispatch only indexes the default branch).
 
 on:
   workflow_dispatch:
+  push:
+    branches: ['probe/**']
 
 jobs:
   probe:
