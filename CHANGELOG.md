@@ -22,6 +22,20 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where no finer chart has coverage, as on an ECDIS. Each band now yields
   a native-zoom tileset and, where it overlaps a finer band, an erased
   extended-zoom tileset (`<band>_z<a>-<b>.minus-<finer>.mbtiles`).
+- Same-band duplicates: NOAA's rescheming ships legacy and reschemed cells
+  of one usage band that overlap with `M_COVR CATCOV=1` coverage in both and
+  carry the same objects (an IHO S-57 App. B.1 §2.2 violation; verified in
+  the raw `09CGD_ENCs.zip`). Consolidation concatenated both, so tiles held
+  exact duplicate features (Chicago z10: 51; Block Island z10: 27; also
+  Boston, Delaware Bay, Miami, San Diego, Honolulu). New Stage 2b resolves
+  it before consolidation: within a band the reschemed cell wins (Design
+  Handbook Annex A region codes, unambiguous for bands 1-2), and every layer
+  of the legacy cell is clipped under the reschemed footprints into
+  `data/geojson/<band>.resolved/`. Issue date and compilation scale were
+  rejected as rules because both pick the legacy cell in measured cases.
+  Bands 3-6 are detected and warned only. Each overlap is recorded in
+  `data/merged/<band>/.same-band-overlaps.json` for reporting to NOAA.
+  Research and evidence in `docs/SAME-BAND-OVERLAP.md`.
 - Resume: a cell whose GeoJSON directory held an orphan layer file (an
   object class the cell no longer has after an ER update, or a leftover
   from an older export) never passed the freshness check, so it was
@@ -54,6 +68,13 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   container image has not been verified.
 - `trim_low_bands_to_region` operates on a (priority, path) list so a
   band can contribute more than one tileset.
+- `build_clip_complement` now takes footprint files, a label and a mask
+  directory (shared by the band-level erase and Stage 2b);
+  `consolidate_geojson` accepts per-cell file overrides; gap-fill cell lookup
+  only scans `bandN` directories, not `bandN.resolved`.
+- `verify-r2-charts.py`: downloads each published district file from R2 one
+  at a time, measures coverage gaps and stacking at probe points, and writes
+  a Markdown report. Alaska is excluded unless named.
 
 ## [0.6.0] - 2026-09-02
 

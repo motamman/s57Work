@@ -34,6 +34,7 @@ Single-file pipeline with five stages per band/source:
 1. **Extract** — unzip inputs into `data/enc/`
 2. **Find** — discover `.000` ENC files (group by NOAA band in `--by-band` mode)
 3. **GDAL export** — `ogr2ogr` (native or container) converts each ENC layer to GeoJSON in `data/geojson/`. SOUNDG layer gets special handling (`SPLIT_MULTIPOINT=YES`, `ADD_SOUNDG_DEPTH=YES`) to produce individual depth points with a `DEPTH` property
+3b. **Same-band overlap resolution** (by-band only) — NOAA ships legacy and reschemed cells of one band overlapping with data in both; the reschemed cell wins and every layer of the legacy cell is clipped under the reschemed `M_COVR` footprints into `data/geojson/<band>.resolved/`, with a record in `data/merged/<band>/.same-band-overlaps.json`. Bands 3-6 are warn-only (names can't classify them). See `docs/SAME-BAND-OVERLAP.md`
 4. **Consolidate** — merge per-chart GeoJSON into one file per layer in `data/merged/`
 5. **Erase** (by-band only) — for zooms where a band overlaps a finer band, `ogr2ogr -clipsrc` removes the finer band's chart footprints (`M_COVR`, `CATCOV=1`) from its features, into `data/merged/<band>.minus-<finer>/`
 6. **tippecanoe** — builds one `.mbtiles` per band and zoom group in `data/tiles/` with `--no-tile-size-limit --no-feature-limit`
@@ -59,6 +60,8 @@ All artifacts stored in `./data/` and preserved between runs for resume capabili
 ```
 s57-to-mbtiles.py          # the tool
 check-tile-overlap.py       # diagnostic: shared tile addresses between tilesets, per-tile layer counts
+check-tile-duplicates.py    # diagnostic: chart cells stacked and exact duplicate features per tile in a merged file
+verify-r2-charts.py         # downloads each published district file, measures coverage gaps and stacking, writes a report
 pyproject.toml              # project metadata; the version lives here and nowhere else
 enc-sources.yaml            # CI build definitions
 docs/
@@ -74,3 +77,4 @@ data/                       # gitignored working directory
 - `docs/INSTALL.md` — install guide for tippecanoe, GDAL, podman/docker (Raspberry Pi and macOS)
 - `docs/USAGE.md` — detailed usage guide covering all five modes of operation and CLI options
 - `docs/SOUNDG-FIX.md` — documents the SOUNDG depth sounding fix (both the tile generation bug and the Freeboard-SK rendering bug)
+- `docs/SAME-BAND-OVERLAP.md` — NOAA ships legacy and reschemed cells of the same band with overlapping data (an S-57 App. B.1 §2.2 violation); evidence, standards, NOAA's stated intent, how OpenCPN and others cope, and the Stage 2b mechanism (reschemed wins, bands 1-2)

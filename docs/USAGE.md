@@ -49,6 +49,7 @@ For each band or source, the script runs these stages in order:
 1. Extract    ZIPs / copy directories        → data/enc/
 2. Find       every .000 ENC file recursively
 3. GDAL       ogr2ogr → one GeoJSON per S-57 layer per cell → data/geojson/
+3b. Resolve   (by-band) clip legacy cells under reschemed cells of the same band → data/geojson/<band>.resolved/
 4. Consolidate merge per-cell GeoJSON into one file per layer → data/merged/
 5. tippecanoe one run per band/source over its full zoom range → data/tiles/
 6. tile-join  merge all band/source .mbtiles into the final file
@@ -138,6 +139,7 @@ How it works:
 | 6 | Berthing | ~1:3,000 | z17–z18 | needs `--maxzoom 17` or higher |
 
    **Finer chart wins where bands overlap.** tile-join does not do this for you: when two inputs have the same tile and layer it merges their features into one layer, so the pipeline enforces it before tiling. At every zoom where a band shares zooms with a finer band (band 2's z11–12 with band 3, band 3's z13–14 with band 4, band 4's z15–16 with band 5), the union of the finer band's chart footprints (`M_COVR`, `CATCOV=1`) is erased from the coarser band's features with `ogr2ogr -clipsrc`, into `data/merged/<band>.minus-<finer>/`. Those zooms are tiled from the erased copy; the band's native zooms are tiled from the untouched merged layers. A coarse chart therefore appears only where no finer chart has coverage, exactly as an ECDIS displays it, and the seams follow chart boundaries rather than tile edges. This step needs GDAL with SpatiaLite/GEOS spatial SQL (Ubuntu `gdal-bin`, Homebrew `gdal`).
+   **Same-band overlaps are resolved before consolidation.** NOAA's rescheming currently ships legacy and reschemed cells of one band that overlap with data in both (see `docs/SAME-BAND-OVERLAP.md`). Within a band the reschemed cell wins: every layer of the legacy cell is clipped under the reschemed cells' `M_COVR` footprints into `data/geojson/<band>.resolved/` and those copies replace the originals at consolidation. Cells are classified by NOAA's naming convention, which is unambiguous for bands 1-2 only; overlaps in bands 3-6 are reported as warnings and left alone. Every pair is recorded in `data/merged/<band>/.same-band-overlaps.json`.
 5. Clips band 1/2 output to the district's region. Overview cells can span an entire ocean basin (`US1PO02M` covers the whole North Pacific), which would otherwise put planet-wide tiles and −180..180 bounds into every district file. The region is the union of the district's own band 3+ chart footprints as a z11 tile mask, dilated by one tile. The clipped result is written to a separate `bandN-*.region.mbtiles`; the band's tippecanoe output is never modified, so resume stays correct if a later run adds inputs that widen the region.
 6. Builds any gap fills configured in `enc-sources.yaml` (see below).
 7. Merges everything with tile-join. Gap fills go through the same erase rule with priority `cellband − 0.1`. At each zoom the band NOAA compiled for that zoom wins outright wherever it has coverage; elsewhere finer data wins. A fill therefore shows only in the holes, and a fill of band N cells is fully erased wherever band N itself renders, so nothing is tiled twice.
@@ -204,7 +206,9 @@ data/
 │   ├── all/input0/, input1/…   # staging: each input extracted here
 │   └── band3/, band4/, …       # .000 (+ .001… updates) copied per band
 ├── geojson/
-│   └── band3/, band4/, …       # LAYER_CELL.geojson from ogr2ogr
+│   ├── band3/, band4/, …       # LAYER_CELL.geojson from ogr2ogr
+│   └── band2.resolved/         # legacy cells clipped under reschemed cells (Stage 3b);
+│                               # mask/<CELL>/clip.geojson = the erase polygon
 ├── merged/
 │   ├── band3/, band4/, …       # one LAYER.geojson per band
 │   ├── band3-coastal_z13-14.minus-band4-approach/
@@ -226,7 +230,8 @@ To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the 
 ### What gets skipped on a re-run
 
 - **GDAL**: a cell is re-exported only if its `.000` or any update file is newer than its existing GeoJSON.
-- **Consolidate**: a merged layer is rebuilt only if any of its per-cell inputs is newer, or the heavy-layer minzoom config changed.
+- **Same-band overlap resolution**: detection is cached on the cells' `M_COVR` exports and reruns only when one changes; a clipped legacy layer is redone only if its source file or the clip polygon is newer. Bands with no resolvable pair cost nothing.
+- **Consolidate**: a merged layer is rebuilt only if any of its per-cell inputs (or its clipped replacement) is newer, or the heavy-layer minzoom config changed.
 - **Erase**: the erase polygon is recomputed every run (cheap) but only rewritten when it changes; an erased layer is re-clipped only if its source layer or the erase polygon is newer.
 - **tippecanoe**: a tileset's `.mbtiles` is reused if it is newer than every merged (or erased) layer and its stored zoom range matches the requested one.
 - **Region clipping, gap-fill merging, tile-join**: cheap, always recomputed.

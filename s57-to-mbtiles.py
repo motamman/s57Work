@@ -29,6 +29,8 @@ SKIP GDAL (use existing GeoJSON):
 PIPELINE (per band or source)
   1. Extract ZIPs → data/enc/
   2. ogr2ogr (native or container) → data/geojson/
+  2b. (by-band) Clip legacy cells under reschemed cells of the same band
+      → data/geojson/<band>.resolved/  (reschemed cell wins)
   3. Consolidate per-layer GeoJSON → data/merged/
   3b. (by-band) Erase finer charts' footprints from a band's extended
       zooms → data/merged/<band>.minus-<finer>/  (finer chart wins)
@@ -436,6 +438,15 @@ def layer_name_from_stem(stem: str) -> str:
     return stem
 
 
+def cell_name_from_stem(stem: str) -> Optional[str]:
+    """The NOAA cell name a per-cell GeoJSON stem ends with (LAYER_CELL),
+    or None for single-cell exports that carry no suffix."""
+    head, sep, tail = stem.rpartition("_")
+    if sep and ENC_CELL_RE.match(tail):
+        return tail.upper()
+    return None
+
+
 def _remove_orphan_layers(merged_dir: Path, wanted: set):
     """Delete merged LAYER.geojson files no current layer produces (e.g.
     the old "M.geojson" after the layer-name fix), so tippecanoe is not
@@ -672,11 +683,15 @@ def _stamp_marker_stale(merged_dir: Path,
 
 def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
                         max_workers: int = 1,
-                        layer_minzoom: Optional[Dict[str, int]] = None
+                        layer_minzoom: Optional[Dict[str, int]] = None,
+                        overrides: Optional[Dict[str, Path]] = None
                         ) -> List[Path]:
     """Group geojson files by layer name and merge into one file per layer.
     Returns list of merged file paths. layer_minzoom maps layer name →
-    absolute minzoom to stamp per-feature (see LAYER_MIN_ZOOM_OFFSET)."""
+    absolute minzoom to stamp per-feature (see LAYER_MIN_ZOOM_OFFSET).
+    overrides maps a per-cell filename to a replacement file (Stage 2b's
+    clipped copy of a legacy cell); a replacement with no features is
+    skipped, so a fully erased cell contributes nothing."""
     merged_dir.mkdir(parents=True, exist_ok=True)
 
     geojson_files = [f for f in sorted(geojson_dir.glob("*.geojson"))
@@ -687,7 +702,10 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
     # Group by layer name
     layer_groups: Dict[str, List[Path]] = {}
     for f in geojson_files:
-        layer_groups.setdefault(layer_name_from_stem(f.stem), []).append(f)
+        src = (overrides or {}).get(f.name, f)
+        if src is not f and not _geojson_has_features(src):
+            continue
+        layer_groups.setdefault(layer_name_from_stem(f.stem), []).append(src)
     _remove_orphan_layers(merged_dir, set(layer_groups))
 
     # Per-layer freshness pre-pass (all stale if the stamp config changed)
@@ -970,20 +988,17 @@ def load_footprints(files: List[Path]) -> List[dict]:
     return feats
 
 
-def build_clip_complement(erasers: List[RenderSource], erase_dir: Path,
-                          gdal: GdalRunner) -> Path:
-    """Write erase_dir/mask/clip.geojson: one polygon feature covering the
-    world minus the union of the erasers' footprints. The file is only
-    replaced when its content changes, so mtime-based freshness of the
-    erased layers keeps working across runs. The mask files live in a
-    subdirectory because tippecanoe is fed every *.geojson in erase_dir —
-    a world-sized clip polygon must never become a layer."""
-    mask_dir = erase_dir / "mask"
+def build_clip_complement(footprint_files: List[Path], labels: str,
+                          mask_dir: Path, gdal: GdalRunner) -> Path:
+    """Write mask_dir/clip.geojson: one polygon feature covering the world
+    minus the union of the CATCOV=1 footprints in footprint_files. The
+    file is only replaced when its content changes, so mtime-based
+    freshness of the clipped layers keeps working across runs. The mask
+    files live in their own subdirectory because tippecanoe is fed every
+    *.geojson in a merged dir — a world-sized clip polygon must never
+    become a layer. labels names the erasers for messages."""
     mask_dir.mkdir(parents=True, exist_ok=True)
-    feats: List[dict] = []
-    for e in erasers:
-        feats.extend(load_footprints(e.footprint_files))
-    labels = ", ".join(e.label for e in erasers)
+    feats: List[dict] = load_footprints(footprint_files)
     if not feats:
         raise RuntimeError(
             f"no M_COVR (CATCOV=1) footprints found for {labels}; "
@@ -1080,7 +1095,8 @@ def _keep_own_dimension(feat: dict) -> bool:
 
 
 def erase_layer(src_file: Path, clip: Path, out_path: Path,
-                stamp_minzoom: Optional[int], gdal: GdalRunner) -> int:
+                stamp_minzoom: Optional[int], gdal: GdalRunner,
+                note: Optional[str] = None) -> int:
     """Stream src_file through `ogr2ogr -clipsrc clip` and write the
     survivors as a FeatureCollection to out_path, re-applying the
     per-feature tippecanoe minzoom stamp that the round trip drops and
@@ -1126,8 +1142,9 @@ def erase_layer(src_file: Path, clip: Path, out_path: Path,
         # so a fully-erased layer is not re-clipped on every run.
         with open(tmp, "w") as out:
             json.dump({"type": "FeatureCollection",
-                       "note": f"every {src_file.stem} feature lies inside "
-                               "finer-chart coverage; nothing to render",
+                       "note": note or (f"every {src_file.stem} feature lies "
+                                        "inside finer-chart coverage; "
+                                        "nothing to render"),
                        "features": []}, out)
     tmp.replace(out_path)
     return n
@@ -1140,7 +1157,9 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
     polygon changed; outputs whose source layer vanished are removed."""
     src = run.source
     erase_dir = data_dir / "merged" / run.stem
-    clip = build_clip_complement(run.erased_by, erase_dir, gdal)
+    clip = build_clip_complement(
+        [f for e in run.erased_by for f in e.footprint_files],
+        ", ".join(e.label for e in run.erased_by), erase_dir / "mask", gdal)
 
     merged_files = [f for f in sorted(src.merged_dir.glob("*.geojson"))
                     if f.stat().st_size > 100]
@@ -1504,7 +1523,8 @@ def _prepare_gap_fill_group(
     for cell_id in group.cells:
         matches: List[Path] = []
         for band_dir in sorted(geojson_root.glob("band*")):
-            if band_dir.is_dir():
+            # bandN only: bandN.resolved holds Stage 2b's clipped copies
+            if band_dir.is_dir() and re.fullmatch(r"band\d+", band_dir.name):
                 matches.extend(band_dir.glob(f"*_{cell_id}.geojson"))
         if matches:
             cell_files[cell_id] = matches
@@ -1571,6 +1591,347 @@ def _prepare_gap_fill_group(
 
 
 # ---------------------------------------------------------------------------
+# Stage 2b: same-band overlap resolution (by-band mode)
+# ---------------------------------------------------------------------------
+# NOAA's rescheming ships legacy and reschemed cells of the SAME usage band
+# that overlap with M_COVR CATCOV=1 coverage in both and carry the same
+# objects (same LNAM) — an IHO S-57 App. B.1 §2.2 violation ("in the area
+# of overlap only one cell may contain data"). Consolidation concatenates
+# every cell of a band, so the overlap became exact duplicate features in
+# the tiles (Chicago z10: 51; Block Island z10: 27). Stage 3b cannot see
+# it: both cells have the same band priority. Full evidence, standards and
+# the rejected alternatives (issue date, compilation scale — both wrong on
+# the data) are in docs/SAME-BAND-OVERLAP.md.
+#
+# Rule: within a band the reschemed cell wins. Every layer of a legacy
+# cell — including its own M_COVR, so its CATCOV=1 polygon loses the
+# overlap exactly as §2.2 requires of the producer — is clipped by the
+# complement of the union of the overlapping reschemed cells' CATCOV=1
+# footprints before consolidation. Cells are classified by name using
+# NOAA's ENC Design Handbook (June 2024): legacy cells look like US2EC03M;
+# reschemed cells carry an Annex A region code in characters 4-6. Only
+# band 1 (GLB) and band 2 (ARC ANT ATL GRL GOM PAC) codes are unambiguous;
+# bands 3-6 reuse state codes that legacy harbour cells also used, so
+# overlaps there are detected and WARNED but never erased. Every overlap
+# is recorded in data/merged/bandN/.same-band-overlaps.json for reporting
+# to NOAA; once NOAA cuts back the legacy cells the rule has nothing to do.
+
+LEGACY_CELL_RE = re.compile(r'^US\d[A-Z]{2}\d{2}M$', re.IGNORECASE)
+RESCHEMED_REGION_CODES: Dict[int, set] = {
+    1: {"GLB"},
+    2: {"ARC", "ANT", "ATL", "GRL", "GOM", "PAC"},
+}
+# Real legacy/reschemed overlaps are whole-cell scale (tenths of deg² and
+# up); the edge slivers legitimately shared by adjacent cells measure
+# ~2e-6 deg². 1e-4 deg² is about 1 km² at mid latitudes.
+SAME_BAND_OVERLAP_MIN_AREA = 1e-4
+SAME_BAND_RULE = "reschemed-wins-v1"
+
+
+def classify_cell(name: str) -> str:
+    """'legacy', 'reschemed' or 'unknown' from a NOAA cell name."""
+    name = name.upper()
+    if LEGACY_CELL_RE.match(name):
+        return "legacy"
+    band = enc_band(Path(name))
+    if band in RESCHEMED_REGION_CODES and name[3:6] in RESCHEMED_REGION_CODES[band]:
+        return "reschemed"
+    return "unknown"
+
+
+@dataclass
+class OverlapPair:
+    a: str
+    b: str
+    area_deg2: float  # NaN when the exact test could not run
+
+
+def load_cell_footprints(band_geojson_dir: Path) -> Dict[str, List[dict]]:
+    """cell name → its M_COVR CATCOV=1 features, from the per-cell exports.
+    Single-cell exports carry no cell suffix and are skipped."""
+    out: Dict[str, List[dict]] = {}
+    for f in sorted(band_geojson_dir.glob("M_COVR_*.geojson")):
+        cell = cell_name_from_stem(f.stem)
+        if not cell:
+            continue
+        feats = load_footprints([f])
+        if feats:
+            out[cell] = feats
+    return out
+
+
+def _geom_bbox(feats: List[dict]) -> Tuple[float, float, float, float]:
+    xs: List[float] = []
+    ys: List[float] = []
+
+    def walk(c):
+        if isinstance(c[0], (int, float)):
+            xs.append(c[0])
+            ys.append(c[1])
+        else:
+            for k in c:
+                walk(k)
+
+    for ft in feats:
+        walk(ft["geometry"]["coordinates"])
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _bbox_candidates(bboxes: Dict[str, Tuple[float, float, float, float]],
+                     eps: float = 1e-6) -> List[Tuple[str, str]]:
+    """Cell pairs whose bounding boxes overlap by more than eps on both
+    axes (exact grid-edge sharing is excluded)."""
+    names = sorted(bboxes)
+    pairs = []
+    for i, a in enumerate(names):
+        ax0, ay0, ax1, ay1 = bboxes[a]
+        for b in names[i + 1:]:
+            bx0, by0, bx1, by1 = bboxes[b]
+            if (min(ax1, bx1) - max(ax0, bx0) > eps
+                    and min(ay1, by1) - max(ay0, by0) > eps):
+                pairs.append((a, b))
+    return pairs
+
+
+def find_same_band_overlaps(footprints: Dict[str, List[dict]],
+                            candidates: List[Tuple[str, str]],
+                            scratch_dir: Path, gdal: GdalRunner
+                            ) -> Tuple[List[OverlapPair], bool]:
+    """Exact CATCOV=1 overlap area for each candidate pair, via one GDAL
+    SQLite-dialect self-join streamed as CSV. Returns (pairs, exact). If
+    GDAL fails (e.g. an invalid legacy polygon), every candidate is
+    returned with area NaN and exact=False: erasing by a footprint that
+    does not really overlap removes nothing, so over-approximating is
+    safe, but the record says the areas are unknown."""
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    cells = sorted({c for pair in candidates for c in pair})
+    src = scratch_dir / "candidates.geojson"
+    feats = [{"type": "Feature", "properties": {"cell": c},
+              "geometry": ft["geometry"]}
+             for c in cells for ft in footprints[c]]
+    with open(src, "w") as out:
+        json.dump({"type": "FeatureCollection", "features": feats}, out)
+    sql = ("SELECT a.cell AS ca, b.cell AS cb, "
+           "SUM(ST_Area(ST_Intersection(a.geometry, b.geometry))) AS area "
+           "FROM candidates a, candidates b "
+           "WHERE a.cell < b.cell AND ST_Intersects(a.geometry, b.geometry) "
+           "GROUP BY a.cell, b.cell")
+    res = subprocess.run(
+        gdal.cmd(["ogr2ogr", "-f", "CSV", "/vsistdout/", src,
+                  "-dialect", "SQLITE", "-sql", sql]),
+        capture_output=True, text=True)
+    if res.returncode != 0:
+        print("WARNING: exact same-band overlap test failed; treating every "
+              "bounding-box candidate as overlapping.\n"
+              f"{res.stderr.strip()}", file=sys.stderr)
+        return [OverlapPair(a, b, float("nan")) for a, b in candidates], False
+    wanted = set(candidates)
+    pairs: List[OverlapPair] = []
+    for line in res.stdout.splitlines()[1:]:
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        a, b = parts[0].upper(), parts[1].upper()
+        try:
+            area = float(parts[2]) if parts[2] else 0.0
+        except ValueError:
+            area = float("nan")
+        key = (a, b) if (a, b) in wanted else ((b, a) if (b, a) in wanted else None)
+        if key:
+            pairs.append(OverlapPair(key[0], key[1], area))
+    return pairs, True
+
+
+def plan_same_band_resolution(pairs: List[OverlapPair]):
+    """Split overlap pairs into resolved (legacy → sorted reschemed
+    erasers), unresolved [(pair, reason)] and slivers [pair]."""
+    resolved: Dict[str, List[str]] = {}
+    unresolved: List[Tuple[OverlapPair, str]] = []
+    slivers: List[OverlapPair] = []
+    for p in pairs:
+        area = p.area_deg2
+        if area == area and area < SAME_BAND_OVERLAP_MIN_AREA:  # NaN-safe
+            slivers.append(p)
+            continue
+        ka, kb = classify_cell(p.a), classify_cell(p.b)
+        if {ka, kb} == {"legacy", "reschemed"}:
+            legacy, resch = (p.a, p.b) if ka == "legacy" else (p.b, p.a)
+            resolved.setdefault(legacy, []).append(resch)
+        else:
+            unresolved.append((p, f"{ka} x {kb}"))
+    for k in resolved:
+        resolved[k].sort()
+    return resolved, unresolved, slivers
+
+
+def _count_features(path: Path) -> int:
+    try:
+        with open(path) as f:
+            return len(json.load(f).get("features", []))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return 0
+
+
+def _write_if_changed(path: Path, text: str):
+    try:
+        if path.exists() and path.read_text() == text:
+            return
+    except OSError:
+        pass
+    path.write_text(text)
+
+
+def _cleanup_resolved(resolved_dir: Path, keep: set):
+    """Drop clipped outputs and mask dirs of cells that are no longer
+    resolved (their overlap went away, or NOAA cut back the legacy cell)."""
+    if not resolved_dir.is_dir():
+        return
+    for f in resolved_dir.iterdir():
+        if f.is_file() and (f.suffix in (".geojson", ".tmp", ".stderr")):
+            if cell_name_from_stem(f.stem) not in keep:
+                f.unlink()
+    mask_root = resolved_dir / "mask"
+    if mask_root.is_dir():
+        for d in mask_root.iterdir():
+            if d.is_dir() and d.name.upper() not in keep:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+def resolve_same_band_overlaps(band: int, label: str,
+                               band_geojson_dir: Path, resolved_dir: Path,
+                               record_path: Path, gdal: GdalRunner,
+                               max_workers: int) -> Dict[str, Path]:
+    """Stage 2b entry point. Returns the consolidation overrides map
+    (per-cell filename → clipped copy) for every resolved legacy cell;
+    empty when the band has no resolvable overlap."""
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    footprints = load_cell_footprints(band_geojson_dir)
+    inputs = {}
+    for c in footprints:
+        st = (band_geojson_dir / f"M_COVR_{c}.geojson").stat()
+        inputs[c] = [st.st_mtime_ns, st.st_size]
+    base = {"rule": SAME_BAND_RULE, "band": band, "inputs": inputs}
+
+    if len(footprints) < 2:
+        _cleanup_resolved(resolved_dir, set())
+        _write_if_changed(record_path, json.dumps(
+            dict(base, exact=True, pairs=[], resolved=[], unresolved=[],
+                 slivers=[]), indent=1, sort_keys=True))
+        return {}
+
+    # Detection is cached in the record: it only reruns when a cell's
+    # M_COVR export changed (every layer of a cell is rewritten together).
+    pairs: Optional[List[OverlapPair]] = None
+    exact = True
+    try:
+        cached = json.loads(record_path.read_text())
+        if (cached.get("rule") == SAME_BAND_RULE
+                and cached.get("inputs") == inputs and "pairs" in cached):
+            pairs = [OverlapPair(**p) for p in cached["pairs"]]
+            exact = bool(cached.get("exact", True))
+    except (OSError, ValueError, TypeError):
+        pairs = None
+    if pairs is None:
+        bboxes = {c: _geom_bbox(g) for c, g in footprints.items()}
+        cands = _bbox_candidates(bboxes)
+        if cands:
+            pairs, exact = find_same_band_overlaps(
+                footprints, cands, resolved_dir / "mask", gdal)
+        else:
+            pairs, exact = [], True
+
+    resolved, unresolved, slivers = plan_same_band_resolution(pairs)
+    if resolved or unresolved:
+        print(f"\n-- Band {band}: same-band overlap check (reschemed wins) --")
+    for p, reason in unresolved:
+        area = "unknown" if p.area_deg2 != p.area_deg2 else f"{p.area_deg2:.4f} deg²"
+        print(f"WARNING: [{label}] same-band overlap not resolved ({reason}): "
+              f"{p.a} x {p.b}, {area}", file=sys.stderr)
+
+    _cleanup_resolved(resolved_dir, set(resolved))
+    overrides: Dict[str, Path] = {}
+    report = []
+    area_of = {(p.a, p.b): p.area_deg2 for p in pairs}
+    area_of.update({(p.b, p.a): p.area_deg2 for p in pairs})
+    for legacy, erasers in sorted(resolved.items()):
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+        tag = "+".join(erasers)
+        clip = build_clip_complement(
+            [band_geojson_dir / f"M_COVR_{r}.geojson" for r in erasers],
+            tag, resolved_dir / "mask" / legacy, gdal)
+        srcs = [f for f in sorted(band_geojson_dir.glob(f"*_{legacy}.geojson"))
+                if f.stat().st_size > 100]
+        todo = [f for f in srcs
+                if not output_is_fresh(resolved_dir / f.name, [f, clip])]
+        fresh = len(srcs) - len(todo)
+        if todo:
+            print(f"  [{label}] {legacy} (legacy) under {tag}: clipping "
+                  f"{len(todo)} layer(s) ({fresh} fresh)...")
+        else:
+            print(f"  [{label}] {legacy} (legacy) under {tag}: all {fresh} "
+                  "clipped layers fresh")
+        note = (f"every {legacy} feature of this layer lies inside reschemed "
+                f"coverage ({tag}); removed under S-57 App. B.1 2.2")
+
+        def one(f: Path) -> int:
+            return erase_layer(f, clip, resolved_dir / f.name, None, gdal,
+                               note=note)
+
+        if max_workers <= 1 or len(todo) <= 1:
+            for f in todo:
+                one(f)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(one, f): f for f in todo}
+                for fut in as_completed(futures):
+                    exc = fut.exception()
+                    if exc:
+                        raise RuntimeError(
+                            f"same-band clip failed for {futures[fut].name}: {exc}")
+
+        before = {f.stem: _count_features(f) for f in srcs}
+        after = {f.stem: _count_features(resolved_dir / f.name) for f in srcs}
+        removed_by_layer = {}
+        emptied = []
+        for stem in before:
+            layer = layer_name_from_stem(stem)
+            gone = before[stem] - after[stem]
+            if gone > 0:
+                removed_by_layer[layer] = gone
+            if after[stem] == 0:
+                emptied.append(layer)
+        removed = sum(removed_by_layer.values())
+        total = sum(before.values())
+        print(f"  [{label}] {legacy}: removed {removed:,} of {total:,} features; "
+              f"{len(emptied)} layer(s) emptied"
+              + (f" ({', '.join(sorted(emptied)[:6])}"
+                 f"{'…' if len(emptied) > 6 else ''})" if emptied else ""))
+        for f in srcs:
+            overrides[f.name] = resolved_dir / f.name
+        report.append({
+            "legacy": legacy, "reschemed": erasers,
+            "overlap_deg2": {r: area_of.get((legacy, r)) for r in erasers},
+            "layers_clipped": len(srcs), "features_before": total,
+            "features_removed": removed, "layers_emptied": sorted(emptied),
+            "removed_by_layer": dict(sorted(removed_by_layer.items())),
+        })
+
+    def _pair(p: OverlapPair):
+        return {"cells": [p.a, p.b],
+                "overlap_deg2": None if p.area_deg2 != p.area_deg2 else p.area_deg2}
+
+    record = dict(base, exact=exact,
+                  pairs=[{"a": p.a, "b": p.b, "area_deg2": p.area_deg2}
+                         for p in pairs],
+                  resolved=report,
+                  unresolved=[dict(_pair(p), reason=r) for p, r in unresolved],
+                  slivers=[_pair(p) for p in slivers])
+    _write_if_changed(record_path, json.dumps(record, indent=1, sort_keys=True))
+    return overrides
+
+
+
+# ---------------------------------------------------------------------------
 # Band pipeline (stages 2-3 for one band)
 # ---------------------------------------------------------------------------
 
@@ -1621,6 +1982,15 @@ def prepare_band(
         band_enc_dir, band_geojson_dir, band_cells, label=label,
         native_gdal=native_gdal, runtime=runtime, max_workers=max_workers)
 
+    # Stage 2b: clip legacy cells under reschemed cells of the same band
+    # (see the Stage 2b section). Returns per-cell file overrides for
+    # consolidation; empty when the band has no resolvable overlap.
+    gdal = GdalRunner(native_gdal, runtime, data_dir)
+    overrides = resolve_same_band_overlaps(
+        band, label, band_geojson_dir,
+        band_geojson_dir.with_name(f"band{band}.resolved"),
+        band_merged_dir / ".same-band-overlaps.json", gdal, max_workers)
+
     # Stage 3: Consolidate. Heavy layers get a per-feature minzoom stamp,
     # offset from the band's NATIVE minzoom (not the CLI-effective one) so
     # cached merged files stay valid across zoom-argument changes.
@@ -1629,13 +1999,16 @@ def prepare_band(
                      for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
     merged = consolidate_geojson(band_geojson_dir, band_merged_dir,
                                  max_workers=max_workers,
-                                 layer_minzoom=layer_minzoom)
+                                 layer_minzoom=layer_minzoom,
+                                 overrides=overrides)
     if not merged:
         print(f"WARNING: [{label}] nothing to render", file=sys.stderr)
         return None
 
-    # Footprints: M_COVR per cell (single-cell exports drop the suffix).
-    footprints = sorted(band_geojson_dir.glob("M_COVR*.geojson"))
+    # Footprints: M_COVR per cell (single-cell exports drop the suffix);
+    # a clipped legacy cell contributes its trimmed M_COVR.
+    footprints = [overrides.get(f.name, f)
+                  for f in sorted(band_geojson_dir.glob("M_COVR*.geojson"))]
     return RenderSource(
         priority=float(band),
         label=label,
