@@ -77,11 +77,13 @@ def download(district, dest, attempts=8):
     t0 = time.time()
     last = None
     for _ in range(attempts):
-        res = subprocess.run(["curl", "-sSL", "-C", "-", "--retry", "3",
+        res = subprocess.run(["curl", "-sSL", "--fail", "-C", "-", "--retry", "3",
                               "-o", str(dest), url])
         if res.returncode == 0:
             return time.time() - t0
         last = res.returncode
+        if last == 22:  # HTTP error (404 etc.): retrying won't help
+            break
         time.sleep(5)
     raise subprocess.CalledProcessError(last, ["curl", url])
 
@@ -113,7 +115,7 @@ def coverage_gaps(tiles):
 
 def decode(path, z, x, y):
     res = subprocess.run(["tippecanoe-decode", "-c", str(path), str(z), str(x), str(y)],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, check=True)
     import json
     feats = []
     for line in res.stdout.splitlines():
@@ -186,12 +188,20 @@ def main():
     # owner's request. Name it explicitly to measure it.
     ap.add_argument("districts", nargs="*",
                     default=[d for d in PROBES if d != "17CGD"])
-    ap.add_argument("--scratch", type=Path, default=Path(os.environ.get("VERIFY_SCRATCH", "/tmp")))
+    ap.add_argument("--scratch", type=Path,
+                    default=Path(os.environ.get("VERIFY_SCRATCH")
+                                 or Path.home() / ".cache" / "verify-r2-charts"),
+                    help="download directory (default: $VERIFY_SCRATCH or "
+                         "~/.cache/verify-r2-charts, created owner-only)")
     ap.add_argument("--report", type=Path, default=Path("verify-report.md"))
     ap.add_argument("--keep", action="store_true", help="do not delete downloaded files")
     args = ap.parse_args()
 
-    args.scratch.mkdir(parents=True, exist_ok=True)
+    if not args.scratch.exists():
+        # Download paths are predictable, so a fresh scratch dir is
+        # owner-only (chmod after mkdir: mkdir's mode is subject to umask).
+        args.scratch.mkdir(parents=True, mode=0o700)
+        os.chmod(args.scratch, 0o700)
     with open(args.report, "a") as out:
         out.write(f"\n# Chart verification {time.strftime('%Y-%m-%d %H:%M')}\n")
         for d in args.districts:
@@ -204,9 +214,17 @@ def main():
                 out.write(f"\n## {d}\n\nDOWNLOAD FAILED\n")
                 continue
             print(f"[{d}] downloaded in {secs:.0f}s, measuring...", flush=True)
-            measure(d, path, out)
-            if not args.keep:
-                path.unlink()
+            try:
+                measure(d, path, out)
+            except (sqlite3.Error, subprocess.CalledProcessError, OSError) as e:
+                # bad/partial file, tippecanoe-decode missing, or decode failed
+                print(f"[{d}] MEASURE FAILED: {e}", flush=True)
+                out.write(f"\n## {d}\n\nMEASURE FAILED: {e}\n")
+                out.flush()
+                continue
+            finally:
+                if not args.keep:
+                    path.unlink(missing_ok=True)
             print(f"[{d}] DONE", flush=True)
     print("ALL DONE", flush=True)
 

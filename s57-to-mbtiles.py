@@ -681,6 +681,32 @@ def _stamp_marker_stale(merged_dir: Path,
     return True
 
 
+SOURCE_MARKER = ".layer-sources.json"
+
+
+def _source_identity(src: Path, geojson_dir: Path) -> str:
+    """Stable name for a per-cell source file: relative to the geojson
+    root so the plain export ("band3/X.geojson") and Stage 2b's clipped
+    copy ("band3.resolved/X.geojson") are told apart."""
+    try:
+        return str(src.relative_to(geojson_dir.parent))
+    except ValueError:
+        return str(src)
+
+
+def _read_source_marker(merged_dir: Path) -> Dict[str, List[str]]:
+    try:
+        data = json.loads((merged_dir / SOURCE_MARKER).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_source_marker(merged_dir: Path, sources: Dict[str, List[str]]):
+    (merged_dir / SOURCE_MARKER).write_text(
+        json.dumps(sources, indent=1, sort_keys=True))
+
+
 def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
                         max_workers: int = 1,
                         layer_minzoom: Optional[Dict[str, int]] = None,
@@ -699,28 +725,41 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
     if not geojson_files:
         return []
 
-    # Group by layer name
+    # Group by layer name. Alongside the files, record each layer's source
+    # identity: which file was chosen per cell, including overrides that
+    # were skipped for having no features. mtimes can't see an override
+    # being added, removed or emptied (the plain export is older than the
+    # merged file), so the identity is persisted and compared instead.
     layer_groups: Dict[str, List[Path]] = {}
+    layer_sources: Dict[str, List[str]] = {}
     for f in geojson_files:
         src = (overrides or {}).get(f.name, f)
+        layer_name = layer_name_from_stem(f.stem)
+        ident = _source_identity(src, geojson_dir)
         if src is not f and not _geojson_has_features(src):
+            layer_sources.setdefault(layer_name, []).append(ident + "#empty")
             continue
-        layer_groups.setdefault(layer_name_from_stem(f.stem), []).append(src)
+        layer_groups.setdefault(layer_name, []).append(src)
+        layer_sources.setdefault(layer_name, []).append(ident)
     _remove_orphan_layers(merged_dir, set(layer_groups))
 
     # Per-layer freshness pre-pass (all stale if the stamp config changed)
     force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
+    recorded = _read_source_marker(merged_dir)
     fresh: List[Path] = []
     stale: List[Tuple[str, List[Path], Path]] = []
     for layer_name, files in layer_groups.items():
         out_path = merged_dir / f"{layer_name}.geojson"
-        if not force_stale and output_is_fresh(out_path, files):
+        if (not force_stale
+                and recorded.get(layer_name) == layer_sources[layer_name]
+                and output_is_fresh(out_path, files)):
             fresh.append(out_path)
         else:
             stale.append((layer_name, files, out_path))
 
     if not stale:
         print(f"  All {len(layer_groups)} merged layers fresh, skipping")
+        _write_source_marker(merged_dir, layer_sources)
         return sorted(fresh)
 
     print(f"  Consolidating {len(stale)}/{len(layer_groups)} layers "
@@ -751,6 +790,11 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
                 else:
                     results.append(future.result())
 
+    # Record the identity of every layer that is now up to date; a layer
+    # whose merge failed is left out so it is retried next run.
+    done = {p.stem for p in fresh + results}
+    _write_source_marker(merged_dir, {k: v for k, v in layer_sources.items()
+                                      if k in done})
     print(f"  Consolidated {len(results)} layers (+ {len(fresh)} fresh)")
     return sorted(fresh + results)
 
