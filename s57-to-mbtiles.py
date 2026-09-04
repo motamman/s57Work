@@ -30,7 +30,9 @@ PIPELINE (per band or source)
   1. Extract ZIPs → data/enc/
   2. ogr2ogr (native or container) → data/geojson/
   3. Consolidate per-layer GeoJSON → data/merged/
-  4. tippecanoe (one per band, full zoom range) → data/tiles/
+  3b. (by-band) Erase finer charts' footprints from a band's extended
+      zooms → data/merged/<band>.minus-<finer>/  (finer chart wins)
+  4. tippecanoe (one per band and zoom group) → data/tiles/
   5. tile-join → final .mbtiles
 
 All artifacts stored in ./data/, nothing deleted between runs.
@@ -417,6 +419,32 @@ def enc_band(enc_file: Path) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+ENC_CELL_RE = re.compile(r'^US\d[A-Z0-9]{5}$', re.IGNORECASE)
+
+
+def layer_name_from_stem(stem: str) -> str:
+    """S-57 layer name from a per-cell GeoJSON stem.
+
+    Multi-cell exports are named LAYER_CELL (e.g. DEPARE_US5MA1SK); a
+    single-cell export is just LAYER. Layer names themselves may contain
+    underscores (M_COVR, M_QUAL, M_NSYS, TS_FEB), so only a trailing NOAA
+    cell name is stripped — never everything after the first underscore,
+    which folded every M_* meta layer into one layer called "M"."""
+    head, sep, tail = stem.rpartition("_")
+    if sep and ENC_CELL_RE.match(tail):
+        return head
+    return stem
+
+
+def _remove_orphan_layers(merged_dir: Path, wanted: set):
+    """Delete merged LAYER.geojson files no current layer produces (e.g.
+    the old "M.geojson" after the layer-name fix), so tippecanoe is not
+    fed a stale layer alongside the correct ones."""
+    for f in merged_dir.glob("*.geojson"):
+        if f.stem not in wanted:
+            f.unlink()
+
+
 def group_by_band(enc_files: List[Path]) -> Dict[int, List[Path]]:
     groups: Dict[int, List[Path]] = {}
     for f in enc_files:
@@ -493,13 +521,21 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
             if m:
                 layers.append(m.group(1))
 
+        # Drop every existing output of this cell, not just the layers
+        # about to be rewritten: an orphan from a layer the cell no
+        # longer has (object class removed by an ER update, or an older
+        # export) keeps an old mtime, fails cell_outputs_fresh forever,
+        # and forces a re-export — and a cascade of stale merged layers
+        # and tilesets — on every run.
+        pattern = f"*_{name}.geojson" if multi_file else "*.geojson"
+        for old in geojson_dir.glob(pattern):
+            old.unlink()
+
         for layer in layers:
             if layer in SKIP_LAYERS:
                 continue
             outname = f"{layer}_{name}" if multi_file else layer
             outpath = geojson_dir / f"{outname}.geojson"
-            if outpath.exists():
-                outpath.unlink()
             cmd = ["ogr2ogr", "-f", "GeoJSON", "-oo", "LIST_AS_STRING=YES"]
             if layer == "SOUNDG":
                 cmd.extend(["-oo", "SPLIT_MULTIPOINT=YES",
@@ -530,6 +566,9 @@ def _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
                       multi_file, tag, label):
     skip_case = "|".join(SKIP_LAYERS)
     name_template = "${layer}_${name}" if multi_file else "${layer}"
+    # Same orphan cleanup as _export_native (see comment there).
+    rm_pattern = ('/output/*_"$name".geojson' if multi_file
+                  else '/output/*.geojson')
 
     # Pass explicit relative paths so the container processes only the
     # cells the freshness check decided are stale.
@@ -546,6 +585,7 @@ for rel in $cells; do
   i=$((i + 1))
   name=$(basename "$enc" .000)
   echo "[$i/$count] $name"
+  rm -f {rm_pattern}
   layers=$(ogrinfo -so "$enc" 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{{print $2}}' | awk '{{print $1}}')
   for layer in $layers; do
     case "$layer" in {skip_case}) continue ;; esac
@@ -647,8 +687,8 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
     # Group by layer name
     layer_groups: Dict[str, List[Path]] = {}
     for f in geojson_files:
-        layer_name = f.stem.split("_")[0] if "_" in f.stem else f.stem
-        layer_groups.setdefault(layer_name, []).append(f)
+        layer_groups.setdefault(layer_name_from_stem(f.stem), []).append(f)
+    _remove_orphan_layers(merged_dir, set(layer_groups))
 
     # Per-layer freshness pre-pass (all stale if the stamp config changed)
     force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
@@ -701,6 +741,18 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
 # Stage 4: tippecanoe (one invocation per band, full zoom range)
 # ---------------------------------------------------------------------------
 
+def _geojson_has_features(path: Path) -> bool:
+    """False for a FeatureCollection whose features array is empty — the
+    padded file erase_layer writes when a whole layer lies inside finer
+    coverage. tippecanoe exits non-zero when every input is empty."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    return not re.search(rb'"features"\s*:\s*\[\s*\]', head)
+
+
 def run_tippecanoe_for_source(
     merged_dir: Path,
     tile_dir: Path,
@@ -714,9 +766,10 @@ def run_tippecanoe_for_source(
     JSON layer-spec form of -L. Returns the produced .mbtiles path, or None
     if there's nothing to build."""
     merged_files = [f for f in sorted(merged_dir.glob("*.geojson"))
-                    if f.stat().st_size > 100]
+                    if f.stat().st_size > 100 and _geojson_has_features(f)]
     if not merged_files:
-        print(f"WARNING: No GeoJSON in {merged_dir}, skipping", file=sys.stderr)
+        print(f"  [{stem}] no features to render (all erased or empty), "
+              "skipping")
         return None
 
     final = tile_dir / f"{stem}.mbtiles"
@@ -767,6 +820,372 @@ def run_tippecanoe_for_source(
     _patch_metadata(final, stem)
     print(f"  [{stem}] done ({final.stat().st_size / 1048576:.1f} MB)")
     return final
+
+
+# ---------------------------------------------------------------------------
+# Stage 3b: finer-wins erase (by-band mode)
+# ---------------------------------------------------------------------------
+# tile-join does NOT let a later input win where tilesets overlap. When two
+# inputs carry the same tile and the same layer, their features are
+# concatenated into one layer — its README: "If they define the same
+# layers or the same tiles, the layers or tiles are merged" (verified
+# against v2.78.0). So every overlap between one band's extended zooms and
+# the next band's native zooms shipped BOTH charts' features in the same
+# tiles, with a draw order that is not controllable and flips between
+# tiles. Opaque depth-area fills then showed the coarse chart on top in
+# some tiles and the fine chart in their neighbours (the Sept 2026
+# tile-shaped-patches regression around Block Island).
+#
+# What an ECDIS does instead: a coarser chart is shown only where no finer
+# chart has coverage. This stage reproduces that. Every render source (a
+# band, or a gap-fill group) has a priority. Before a source is tiled at
+# zooms where higher-priority sources also render, the union of those
+# sources' chart footprints — the M_COVR objects with CATCOV=1 that every
+# S-57 cell carries — is erased from its features. The erased copy lives
+# in its own merged dir and is tiled separately; the pristine merged dir
+# and its tippecanoe output still serve the source's native zooms.
+#
+# Mechanics: the footprint union and its complement are computed once per
+# (source, erasing set) with GDAL's SQLite dialect (ST_Union/ST_Difference
+# need SpatiaLite or GEOS in the GDAL build; Ubuntu's gdal-bin has it).
+# Each merged layer is then streamed through `ogr2ogr -clipsrc
+# <complement>` as GeoJSONSeq, so a layer of any size is clipped without
+# being loaded into memory. Attribute names pass GeoJSON→GeoJSON unchanged;
+# the SQLite route would launder them to lower case, which is why it is
+# used only for the mask. Points inside a finer footprint are dropped,
+# lines and polygons are cut at the footprint edge.
+
+WORLD_WKT = "POLYGON((-180 -90,180 -90,180 90,-180 90,-180 -90))"
+
+
+@dataclass
+class RenderSource:
+    """One consolidated GeoJSON set that renders over zoom_range.
+
+    priority is the band of the data: the band number for a band, and
+    cellband - 0.1 for a gap fill (so a fill of band 4 cells loses to the
+    band 4 run of the same cells and is never tiled twice, but beats band
+    3 and below). native_zoom is the band's own NOAA zoom range, None for
+    fills. At any zoom inside its native range a band outranks everything
+    (see priority_at): the chart NOAA compiled for that scale is shown
+    wherever it has coverage, fills and extensions only where it does not."""
+    priority: float
+    label: str
+    merged_dir: Path
+    footprint_files: List[Path]
+    zoom_range: Tuple[int, int]
+    layer_minzoom: Dict[str, int]
+    native_zoom: Optional[Tuple[int, int]] = None
+
+
+def priority_at(src: RenderSource, z: int) -> float:
+    """Effective priority of a source at zoom z: the native band for that
+    zoom wins outright; otherwise finer data wins."""
+    if src.native_zoom and src.native_zoom[0] <= z <= src.native_zoom[1]:
+        return src.priority + 10
+    return src.priority
+
+
+@dataclass
+class RenderRun:
+    """One tippecanoe invocation: a source over a zoom sub-range, with
+    the footprints of `erased_by` removed from its features first."""
+    source: RenderSource
+    zoom_range: Tuple[int, int]
+    erased_by: List[RenderSource]
+
+    @property
+    def stem(self) -> str:
+        s = self.source.label
+        if self.zoom_range != self.source.zoom_range:
+            s += f"_z{self.zoom_range[0]}-{self.zoom_range[1]}"
+        if self.erased_by:
+            s += ".minus-" + "+".join(e.label for e in self.erased_by)
+        return s
+
+
+class GdalRunner:
+    """Builds ogr2ogr command lines for native or containerized GDAL. In
+    container mode data_dir is mounted at /data and Path arguments under
+    it are rewritten, so every file GDAL touches must live under it."""
+
+    def __init__(self, native: bool, runtime: Optional[str], data_dir: Path):
+        self.native = native
+        self.runtime = runtime
+        self.data_dir = data_dir.resolve()
+
+    def cmd(self, args: list) -> List[str]:
+        if self.native:
+            return [str(a) for a in args]
+        out = []
+        for a in args:
+            if isinstance(a, Path):
+                rel = a.resolve().relative_to(self.data_dir)
+                out.append(f"/data/{rel.as_posix()}")
+            else:
+                out.append(str(a))
+        return [self.runtime, "run", "--rm",
+                "-v", f"{self.data_dir}:/data:Z", GDAL_IMAGE] + out
+
+
+def plan_render_runs(sources: List[RenderSource]) -> List[RenderRun]:
+    """Split each source's zoom range into runs of consecutive zooms that
+    share the same set of higher-priority sources rendering there
+    (priority_at: native band first, then finer data). A run with no such
+    sources is tiled as-is; the others get the erase.
+    Ordered coarse → fine for tile-join (order no longer decides what
+    wins, but it keeps the input list readable)."""
+    runs: List[RenderRun] = []
+    for src in sources:
+        groups: List[list] = []  # [zmin, zmax, erasers]
+        for z in range(src.zoom_range[0], src.zoom_range[1] + 1):
+            erasers = [o for o in sources
+                       if priority_at(o, z) > priority_at(src, z)
+                       and o.zoom_range[0] <= z <= o.zoom_range[1]]
+            key = [o.label for o in erasers]
+            if groups and [o.label for o in groups[-1][2]] == key:
+                groups[-1][1] = z
+            else:
+                groups.append([z, z, erasers])
+        for zmin, zmax, erasers in groups:
+            runs.append(RenderRun(src, (zmin, zmax), erasers))
+    runs.sort(key=lambda r: (r.source.priority, r.zoom_range[0]))
+    return runs
+
+
+def load_footprints(files: List[Path]) -> List[dict]:
+    """Geometry-only features for every M_COVR object with CATCOV=1
+    (area covered by the cell's data) in the given GeoJSON files."""
+    feats = []
+    for f in files:
+        try:
+            fc = json.load(open(f))
+        except (json.JSONDecodeError, OSError):
+            continue
+        for ft in fc.get("features", []):
+            if (ft.get("properties", {}).get("CATCOV") == 1
+                    and ft.get("geometry")):
+                feats.append({"type": "Feature", "properties": {},
+                              "geometry": ft["geometry"]})
+    return feats
+
+
+def build_clip_complement(erasers: List[RenderSource], erase_dir: Path,
+                          gdal: GdalRunner) -> Path:
+    """Write erase_dir/mask/clip.geojson: one polygon feature covering the
+    world minus the union of the erasers' footprints. The file is only
+    replaced when its content changes, so mtime-based freshness of the
+    erased layers keeps working across runs. The mask files live in a
+    subdirectory because tippecanoe is fed every *.geojson in erase_dir —
+    a world-sized clip polygon must never become a layer."""
+    mask_dir = erase_dir / "mask"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    feats: List[dict] = []
+    for e in erasers:
+        feats.extend(load_footprints(e.footprint_files))
+    labels = ", ".join(e.label for e in erasers)
+    if not feats:
+        raise RuntimeError(
+            f"no M_COVR (CATCOV=1) footprints found for {labels}; "
+            "cannot erase finer coverage")
+
+    mask = mask_dir / "footprints.geojson"
+    with open(mask, "w") as out:
+        json.dump({"type": "FeatureCollection", "features": feats}, out)
+
+    tmp = mask_dir / "clip.tmp.geojson"
+    if tmp.exists():
+        tmp.unlink()
+    sql = (f"SELECT ST_Difference(ST_GeomFromText('{WORLD_WKT}'), "
+           f"ST_Union(geometry)) AS geometry FROM {mask.stem}")
+    result = subprocess.run(
+        gdal.cmd(["ogr2ogr", "-f", "GeoJSON", tmp, mask,
+                  "-dialect", "SQLITE", "-sql", sql]),
+        capture_output=True, text=True)
+    ok = result.returncode == 0 and tmp.exists()
+    if ok:
+        try:
+            geom = json.load(open(tmp))["features"][0]["geometry"]
+            ok = bool(geom and geom.get("coordinates"))
+        except (json.JSONDecodeError, OSError, KeyError, IndexError):
+            ok = False
+    if not ok:
+        raise RuntimeError(
+            "GDAL could not compute the footprint complement "
+            f"(ST_Union/ST_Difference) for {labels}. This needs a GDAL "
+            "build with SpatiaLite or GEOS spatial SQL functions.\n"
+            f"{result.stderr.strip()}")
+
+    clip = mask_dir / "clip.geojson"
+    if clip.exists() and clip.read_bytes() == tmp.read_bytes():
+        tmp.unlink()
+    else:
+        tmp.replace(clip)
+    return clip
+
+
+# S-57 PRIM attribute (present on every feature GDAL exports) → the
+# GeoJSON geometry types that carry the same dimension.
+_PRIM_TYPES: Dict[int, Tuple[str, ...]] = {
+    1: ("Point", "MultiPoint"),
+    2: ("LineString", "MultiLineString"),
+    3: ("Polygon", "MultiPolygon"),
+}
+_GEOM_DIM = {"Point": 0, "MultiPoint": 0, "LineString": 1,
+             "MultiLineString": 1, "Polygon": 2, "MultiPolygon": 2}
+
+
+def _keep_own_dimension(feat: dict) -> bool:
+    """Drop the lower-dimension debris a clip leaves behind and return
+    whether anything of the feature's own dimension survives.
+
+    Where a polygon's edge coincides with the erase boundary (a cell
+    clipped by its own footprint, or two cells sharing an edge), GEOS
+    returns the shared edge as a LineString and GDAL passes it through;
+    a line touching the boundary likewise yields Points. The feature's
+    S-57 PRIM (1 point, 2 line, 3 area) says what it really is, so parts
+    of any other dimension are stripped, unwrapping GeometryCollections.
+    Without PRIM, only the highest-dimension parts of a collection are
+    kept."""
+    geom = feat.get("geometry")
+    if not geom:
+        return False
+    prim = feat.get("properties", {}).get("PRIM")
+    parts = (geom["geometries"] if geom["type"] == "GeometryCollection"
+             else [geom])
+    parts = [g for g in parts if g.get("type") in _GEOM_DIM]
+    if not parts:
+        return False
+    if prim in _PRIM_TYPES:
+        want = _PRIM_TYPES[prim]
+    else:
+        top = max(_GEOM_DIM[g["type"]] for g in parts)
+        want = tuple(t for t, d in _GEOM_DIM.items() if d == top)
+    parts = [g for g in parts if g["type"] in want]
+    if not parts:
+        return False
+    if len(parts) == 1:
+        feat["geometry"] = parts[0]
+    else:
+        # Several same-dimension parts: fold into the Multi type.
+        multi = want[1]
+        coords = []
+        for g in parts:
+            if g["type"].startswith("Multi"):
+                coords.extend(g["coordinates"])
+            else:
+                coords.append(g["coordinates"])
+        feat["geometry"] = {"type": multi, "coordinates": coords}
+    return True
+
+
+def erase_layer(src_file: Path, clip: Path, out_path: Path,
+                stamp_minzoom: Optional[int], gdal: GdalRunner) -> int:
+    """Stream src_file through `ogr2ogr -clipsrc clip` and write the
+    survivors as a FeatureCollection to out_path, re-applying the
+    per-feature tippecanoe minzoom stamp that the round trip drops and
+    discarding clip debris of the wrong dimension (_keep_own_dimension).
+    Returns the number of features kept."""
+    tmp = out_path.with_suffix(".tmp")
+    err_path = out_path.with_suffix(".stderr")
+    cmd = gdal.cmd(["ogr2ogr", "-f", "GeoJSONSeq", "/vsistdout/",
+                    src_file, "-clipsrc", clip])
+    n = 0
+    with open(err_path, "w") as err, \
+            subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err) as proc, \
+            open(tmp, "w") as out:
+        out.write('{"type":"FeatureCollection","features":[\n')
+        for raw in proc.stdout:
+            line = raw.strip().lstrip(b"\x1e")
+            if not line:
+                continue
+            feat = json.loads(line)
+            if not _keep_own_dimension(feat):
+                continue
+            if stamp_minzoom is not None:
+                ext = feat.get("tippecanoe")
+                ext = dict(ext) if isinstance(ext, dict) else {}
+                ext["minzoom"] = stamp_minzoom
+                feat["tippecanoe"] = ext
+            if n:
+                out.write(",\n")
+            json.dump(feat, out)
+            n += 1
+        out.write("\n]}\n")
+    rc = proc.returncode
+    if rc != 0:
+        msg = err_path.read_text().strip()
+        tmp.unlink(missing_ok=True)
+        err_path.unlink(missing_ok=True)
+        raise RuntimeError(f"ogr2ogr -clipsrc failed on {src_file.name}: "
+                           f"{msg}")
+    err_path.unlink(missing_ok=True)
+    if n == 0:
+        # Valid, feature-less GeoJSON padded past the 100-byte threshold
+        # output_is_fresh uses to tell a real output from a truncated one,
+        # so a fully-erased layer is not re-clipped on every run.
+        with open(tmp, "w") as out:
+            json.dump({"type": "FeatureCollection",
+                       "note": f"every {src_file.stem} feature lies inside "
+                               "finer-chart coverage; nothing to render",
+                       "features": []}, out)
+    tmp.replace(out_path)
+    return n
+
+
+def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
+                  max_workers: int) -> Path:
+    """Produce (or refresh) the erased merged dir for a run and return
+    it. Layers are re-clipped only when the source layer or the clip
+    polygon changed; outputs whose source layer vanished are removed."""
+    src = run.source
+    erase_dir = data_dir / "merged" / run.stem
+    clip = build_clip_complement(run.erased_by, erase_dir, gdal)
+
+    merged_files = [f for f in sorted(src.merged_dir.glob("*.geojson"))
+                    if f.stat().st_size > 100]
+    wanted = {f.name for f in merged_files}
+    for stale_out in erase_dir.glob("*.geojson"):
+        if stale_out.name not in wanted:
+            stale_out.unlink()
+
+    todo = [f for f in merged_files
+            if not output_is_fresh(erase_dir / f.name, [f, clip])]
+    fresh = len(merged_files) - len(todo)
+    labels = "+".join(e.label for e in run.erased_by)
+    if not todo:
+        print(f"  [{src.label}] z{run.zoom_range[0]}-{run.zoom_range[1]}: "
+              f"all {fresh} erased layers fresh (minus {labels})")
+        return erase_dir
+    print(f"  [{src.label}] z{run.zoom_range[0]}-{run.zoom_range[1]}: "
+          f"erasing {labels} footprints from {len(todo)} layer(s) "
+          f"({fresh} fresh)...")
+
+    def one(f: Path) -> Tuple[str, int]:
+        stamp = src.layer_minzoom.get(f.stem)
+        return f.stem, erase_layer(f, clip, erase_dir / f.name, stamp, gdal)
+
+    kept: Dict[str, int] = {}
+    if max_workers <= 1:
+        for f in todo:
+            name, n = one(f)
+            kept[name] = n
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(one, f): f for f in todo}
+            for fut in as_completed(futures):
+                exc = fut.exception()
+                if exc:
+                    raise RuntimeError(
+                        f"erase failed for {futures[fut].name}: {exc}")
+                name, n = fut.result()
+                kept[name] = n
+    empty = sorted(k for k, v in kept.items() if v == 0)
+    print(f"  [{src.label}] erased {len(kept)} layer(s); "
+          f"{len(empty)} fully inside finer coverage"
+          + (f" ({', '.join(empty[:6])}{'…' if len(empty) > 6 else ''})"
+             if empty else ""))
+    return erase_dir
 
 
 def _patch_metadata(mbtiles_path: Path, name: str):
@@ -836,18 +1255,18 @@ def _tile_coords(db: sqlite3.Connection) -> List[Tuple[int, int, int]]:
         f"SELECT zoom_level, tile_column, tile_row FROM {_tile_table(db)}"))
 
 
-def _region_mask(band_tiles: Dict[int, Path]) -> set:
-    """Union of band>=3 tile coverage as (x, y) pairs at REGION_MASK_ZOOM,
-    dilated by one tile. TMS rows throughout — ancestor math (right-shift)
-    is row-order-agnostic.
+def _region_mask(detail_tiles: List[Path]) -> set:
+    """Union of the given (band>=3) tilesets' coverage as (x, y) pairs at
+    REGION_MASK_ZOOM, dilated by one tile. TMS rows throughout — ancestor
+    math (right-shift) is row-order-agnostic.
 
-    Only each band's bottom-zoom rows are read: coverage at the bottom
-    zoom already spans the band's footprint, and streaming just that level
+    Only each file's bottom-zoom rows are read: coverage at the bottom
+    zoom already spans the file's footprint, and streaming just that level
     avoids materializing the millions of z16 rows a district's band 4/5
     files carry."""
     mask: set = set()
-    for band in sorted(b for b in band_tiles if b >= 3):
-        db = sqlite3.connect(str(band_tiles[band]))
+    for path in detail_tiles:
+        db = sqlite3.connect(str(path))
         table = _tile_table(db)
         zmin = db.execute(f"SELECT MIN(zoom_level) FROM {table}").fetchone()[0]
         if zmin is None or zmin < REGION_MASK_ZOOM:
@@ -885,43 +1304,46 @@ def _recompute_bounds(db: sqlite3.Connection) -> Optional[str]:
     return f"{w},{s},{e},{n}"
 
 
-def trim_low_bands_to_region(band_tiles: Dict[int, Path]
-                             ) -> Dict[int, Path]:
-    """Return the band->mbtiles map to feed tile-join, with band 1/2
-    entries replaced by copies clipped to the district region.
+def trim_low_bands_to_region(tiles: List[Tuple[float, Path]]
+                             ) -> List[Tuple[float, Path]]:
+    """Return the (priority, mbtiles) list to feed tile-join, with entries
+    below band 3 (bands 1/2 and gap fills) replaced by copies clipped to
+    the district region.
 
-    The tippecanoe outputs in band_tiles are never modified: they are the
-    cached build artifacts that the resume logic in
-    run_tippecanoe_for_source relies on, and a clip that deleted rows in
-    place could never be undone when a later run's band>=3 inputs widen
-    the region. Clipping is cheap (band 1/2 files are small), so it is
-    treated like the other cheap stages — always recomputed, into a
-    separate *.region.mbtiles derived file. A low band left with no tiles
-    inside the region is dropped from the returned map. Bands >= 3 pass
-    through untouched. When there is nothing to clip against, the input
-    map is returned unchanged."""
-    low = sorted(b for b in band_tiles if b < 3)
+    The tippecanoe outputs are never modified: they are the cached build
+    artifacts that the resume logic in run_tippecanoe_for_source relies
+    on, and a clip that deleted rows in place could never be undone when
+    a later run's band>=3 inputs widen the region. Clipping is cheap (low
+    band files are small), so it is treated like the other cheap stages —
+    always recomputed, into a separate *.region.mbtiles derived file. A
+    low entry left with no tiles inside the region is dropped from the
+    returned list. Band >= 3 entries pass through untouched. When there is
+    nothing to clip against, the input list is returned unchanged."""
+    low = [(p, path) for p, path in tiles if p < 3]
+    detail = [path for p, path in tiles if p >= 3]
     if not low:
-        return dict(band_tiles)
-    if not any(b >= 3 for b in band_tiles):
+        return list(tiles)
+    if not detail:
         print("WARNING: no band>=3 charts to define the district region; "
               "skipping overview-band clipping", file=sys.stderr)
-        return dict(band_tiles)
+        return list(tiles)
 
-    mask = _region_mask(band_tiles)
+    mask = _region_mask(detail)
     if not mask:
         print("WARNING: empty district-region mask; skipping clipping",
               file=sys.stderr)
-        return dict(band_tiles)
+        return list(tiles)
 
     # Ancestor masks for zooms coarser than the mask zoom.
     anc: Dict[int, set] = {}
     for d in range(1, REGION_MASK_ZOOM + 1):
         anc[d] = {(x >> d, y >> d) for x, y in mask}
 
-    result = dict(band_tiles)
-    for band in low:
-        src = band_tiles[band]
+    result: List[Tuple[float, Path]] = []
+    for prio, src in tiles:
+        if prio >= 3:
+            result.append((prio, src))
+            continue
         dst = src.with_name(f"{src.stem}.region{src.suffix}")
         shutil.copy2(src, dst)
         db = sqlite3.connect(str(dst))
@@ -958,13 +1380,12 @@ def trim_low_bands_to_region(band_tiles: Dict[int, Path]
         db.execute("VACUUM")
         db.close()
         if bounds:
-            print(f"  [band{band}] clipped {len(doomed)} out-of-region "
+            print(f"  [{src.stem}] clipped {len(doomed)} out-of-region "
                   f"tile(s) -> {dst.name}, bounds -> {bounds}")
-            result[band] = dst
+            result.append((prio, dst))
         else:
-            print(f"  [band{band}] clipped all {len(doomed)} tile(s) as "
-                  f"out-of-region; excluding empty band from merge")
-            del result[band]
+            print(f"  [{src.stem}] clipped all {len(doomed)} tile(s) as "
+                  f"out-of-region; excluding empty tileset from merge")
     return result
 
 
@@ -1013,19 +1434,23 @@ def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
 # How it works
 # ------------
 # Each `gap_fills:` group in enc-sources.yaml lists a set of higher-band
-# cell IDs and a zoom_range. process_gap_fill():
+# cell IDs and a zoom_range. prepare_gap_fill_sources():
 #   1. Globs the existing per-band GeoJSON output (data/geojson/band*/)
 #      for files matching each cell ID. Cells not present in this build's
 #      input are silently skipped.
 #   2. Consolidates the matching per-cell GeoJSON into a per-group merged
 #      directory, grouped by layer name.
-#   3. Runs one tippecanoe pass per group at its configured zoom_range,
-#      producing data/tiles/gapfill-<group>.mbtiles.
+#   3. Returns the group as a RenderSource with priority cellband - 0.1.
 #
-# The resulting mbtiles paths are inserted into the final tile-join order
-# between band 2 and band 3 (see process_by_band). Since `tile-join` lets
-# later inputs win on overlap, original-band detail still wins everywhere
-# it has data — fills only show up in tiles the original bands left empty.
+# process_by_band then treats fills like any other source. At every zoom
+# the band NOAA compiled for that zoom outranks everything, and among the
+# rest finer data wins (priority_at); every higher-ranked source's chart
+# footprints are erased from the fill before tippecanoe (Stage 3b). So a
+# fill shows only where the natural pipeline has no chart for that zoom —
+# the effect the old design wrongly expected from tile-join's input
+# order — and a fill of band N cells is fully erased wherever band N
+# itself renders, so the same cells are never tiled twice. Fills of the
+# same cell band do not erase each other; keep such groups disjoint.
 #
 # References (full context in the gap_fills: comment block of
 # enc-sources.yaml):
@@ -1034,19 +1459,13 @@ def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
 #   • Cell creation status map:
 #       https://nauticalcharts.noaa.gov/updates/follow-the-status-of-electronic-navigational-chart-improvements-with-noaas-new-map-viewer/
 
-def process_gap_fill(
+def prepare_gap_fill_sources(
     data_dir: Path,
     minzoom: int,
     maxzoom: int,
-    max_workers: int,
-) -> List[Path]:
-    """Run one tippecanoe pass per configured gap-fill group.
-
-    Returns a list of mbtiles paths produced (empty list if nothing to do
-    or no cells matched in this build). The caller is responsible for
-    inserting these into the tile-join order at the right spot — see
-    process_by_band().
-    """
+) -> List[RenderSource]:
+    """Consolidate every configured gap-fill group that has cells in this
+    build and return them as render sources (empty list if none)."""
     groups = load_gap_fill_config()
     if not groups:
         return []
@@ -1055,24 +1474,23 @@ def process_gap_fill(
     if not geojson_root.is_dir():
         return []
 
-    out_paths: List[Path] = []
+    sources: List[RenderSource] = []
     for group in groups:
-        out = _process_gap_fill_group(
-            group, data_dir, geojson_root, minzoom, maxzoom, max_workers)
-        if out is not None:
-            out_paths.append(out)
-    return out_paths
+        src = _prepare_gap_fill_group(
+            group, data_dir, geojson_root, minzoom, maxzoom)
+        if src is not None:
+            sources.append(src)
+    return sources
 
 
-def _process_gap_fill_group(
+def _prepare_gap_fill_group(
     group: GapFillGroup,
     data_dir: Path,
     geojson_root: Path,
     minzoom: int,
     maxzoom: int,
-    max_workers: int,
-) -> Optional[Path]:
-    """Render one gap-fill group's cells at its configured zoom range."""
+) -> Optional[RenderSource]:
+    """Consolidate one gap-fill group's cells into a render source."""
     effective_min = max(group.zoom_range[0], minzoom)
     effective_max = min(group.zoom_range[1], maxzoom)
     if effective_min > effective_max:
@@ -1100,14 +1518,15 @@ def _process_gap_fill_group(
     print(f"   Cells: {', '.join(present)}")
 
     # Group per-cell GeoJSON files by layer name. The naming convention
-    # comes from process_band's GDAL export step: "LAYER_CELLSTEM.geojson".
+    # comes from prepare_band's GDAL export step: "LAYER_CELLSTEM.geojson"
+    # (layer names may themselves contain underscores, see
+    # layer_name_from_stem).
     layer_groups: Dict[str, List[Path]] = {}
     for files in cell_files.values():
         for f in files:
             if f.stat().st_size <= 100:
                 continue
-            layer_name = f.stem.split("_")[0]
-            layer_groups.setdefault(layer_name, []).append(f)
+            layer_groups.setdefault(layer_name_from_stem(f.stem), []).append(f)
 
     if not layer_groups:
         return None
@@ -1115,6 +1534,7 @@ def _process_gap_fill_group(
     safe_name = re.sub(r'[^\w\-.]', '_', group.name)
     merged_dir = data_dir / "merged" / f"gapfill-{safe_name}"
     merged_dir.mkdir(parents=True, exist_ok=True)
+    _remove_orphan_layers(merged_dir, set(layer_groups))
 
     # Heavy-layer minzoom stamps, offset from the group's configured
     # bottom zoom (config-static, so cached merges stay valid).
@@ -1133,17 +1553,28 @@ def _process_gap_fill_group(
             merge_geojson_layer(layer_name, files, out_path,
                                 stamp_minzoom=stamp)
 
-    tile_dir = data_dir / "tiles"
-    return run_tippecanoe_for_source(
-        merged_dir, tile_dir, f"gapfill-{safe_name}",
-        effective_min, effective_max, max_workers=max_workers)
+    # Priority just below the band of the group's finest cells: the fill
+    # loses to that band's own run (same cells, never tiled twice) and to
+    # the native band of each zoom, and beats every coarser band.
+    cell_band = max((enc_band(Path(c)) or 3) for c in present)
+    # Footprints straight from the per-cell files: layer_groups keys are
+    # the pre-underscore stem, which folds every M_* layer into "M".
+    footprints = sorted(f for files in cell_files.values() for f in files
+                        if f.name.startswith("M_COVR_"))
+    return RenderSource(
+        priority=cell_band - 0.1,
+        label=f"gapfill-{safe_name}",
+        merged_dir=merged_dir,
+        footprint_files=footprints,
+        zoom_range=(effective_min, effective_max),
+        layer_minzoom=layer_minzoom)
 
 
 # ---------------------------------------------------------------------------
-# Band pipeline (stages 2-4 for one band)
+# Band pipeline (stages 2-3 for one band)
 # ---------------------------------------------------------------------------
 
-def process_band(
+def prepare_band(
     band: int,
     enc_files: List[Path],
     data_dir: Path,
@@ -1154,15 +1585,16 @@ def process_band(
     native_gdal: bool,
     runtime: Optional[str],
     max_workers: int,
-) -> Optional[Path]:
-    """Run stages 2-4 for a single band. Returns the band's .mbtiles path."""
+) -> Optional[RenderSource]:
+    """Run stages 2-3 (GDAL export, consolidate) for a single band and
+    return it as a render source; tiling happens in process_by_band once
+    every band's footprints are known."""
     label = f"band{band}-{desc}"
     print(f"\n-- Band {band}: {desc} ({scale})  z{effective_min}-{effective_max} --")
 
     enc_base = data_dir / "enc"
     geojson_base = data_dir / "geojson"
     merged_base = data_dir / "merged"
-    tile_dir = data_dir / "tiles"
 
     band_enc_dir = enc_base / f"band{band}"
     band_geojson_dir = geojson_base / f"band{band}"
@@ -1195,14 +1627,23 @@ def process_band(
     band_zoom_min = BAND_ZOOM[band][0]
     layer_minzoom = {name: band_zoom_min + off
                      for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
-    consolidate_geojson(band_geojson_dir, band_merged_dir,
-                        max_workers=max_workers,
-                        layer_minzoom=layer_minzoom)
+    merged = consolidate_geojson(band_geojson_dir, band_merged_dir,
+                                 max_workers=max_workers,
+                                 layer_minzoom=layer_minzoom)
+    if not merged:
+        print(f"WARNING: [{label}] nothing to render", file=sys.stderr)
+        return None
 
-    # Stage 4: one tippecanoe for the band
-    return run_tippecanoe_for_source(
-        band_merged_dir, tile_dir, label,
-        effective_min, effective_max, max_workers=max_workers)
+    # Footprints: M_COVR per cell (single-cell exports drop the suffix).
+    footprints = sorted(band_geojson_dir.glob("M_COVR*.geojson"))
+    return RenderSource(
+        priority=float(band),
+        label=label,
+        merged_dir=band_merged_dir,
+        footprint_files=footprints,
+        zoom_range=(effective_min, effective_max),
+        layer_minzoom=layer_minzoom,
+        native_zoom=BAND_ZOOM[band][:2])
 
 
 # ---------------------------------------------------------------------------
@@ -1263,40 +1704,45 @@ def process_by_band(
         effective_min = max(zoom_min, minzoom)
         # Each band renders BAND_ZOOM_EXTENSION levels past its native
         # ceiling (capped at the global maxzoom): wherever no finer band
-        # exists, its tiles are the best available chart at deeper zooms,
-        # and tile-join (coarse→fine order) lets finer bands win on
-        # overlap. Band 4 (native z14) thus reaches z16, closing the
-        # no-harbour-chart blanks along the whole charted coast. The cap
-        # exists because extending without limit is intractable: overview
-        # bands cover entire ocean basins, and rendering them to z16
-        # multiplied district builds 4-6x in size and blew the 6h CI
-        # timeout / runner disk on Pacific districts (band 1 of 14CGD at
-        # z16 = tiling the whole Pacific EEZ at harbour zoom).
+        # exists, its tiles are the best available chart at deeper zooms.
+        # Where a finer band DOES exist, Stage 3b erases that band's chart
+        # footprints from the extended zooms before tiling, so the finer
+        # chart is the only one in those tiles (tile-join merges
+        # overlapping layers; it does not let a later input win). Band 4
+        # (native z14) thus reaches z16, closing the no-harbour-chart
+        # blanks along the whole charted coast. The cap exists because
+        # extending without limit is intractable: overview bands cover
+        # entire ocean basins, and rendering them to z16 multiplied
+        # district builds 4-6x in size and blew the 6h CI timeout /
+        # runner disk on Pacific districts (band 1 of 14CGD at z16 =
+        # tiling the whole Pacific EEZ at harbour zoom).
         effective_max = min(zoom_max + BAND_ZOOM_EXTENSION, maxzoom)
         if effective_min > effective_max:
             continue
         band_tasks.append((band, by_band[band], effective_min, effective_max,
                            desc, scale))
 
-    # Run all bands — each band runs stages 2→3→4 sequentially,
-    # but bands run concurrently via threads.
-    # Each band's internal stages use subprocess calls that the OS
-    # schedules across cores.
-    band_tiles: Dict[int, Path] = {}
+    # Stages 2-3 for all bands — each band runs export→consolidate
+    # sequentially, bands concurrently via threads. Tiling waits until
+    # every band is consolidated because a band's extended zooms are
+    # erased by the FINER band's footprints, which come out of its export.
+    sources: List[RenderSource] = []
+
+    def _collect(result: Optional[RenderSource]):
+        if result is not None:
+            sources.append(result)
 
     if len(band_tasks) <= 1 or max_workers <= 1:
         for band, files, emin, emax, desc, scale in band_tasks:
-            result = process_band(
+            _collect(prepare_band(
                 band, files, data_dir, emin, emax, desc, scale,
-                native_gdal, runtime, max_workers)
-            if result is not None:
-                band_tiles[band] = result
+                native_gdal, runtime, max_workers))
     else:
         with ThreadPoolExecutor(max_workers=min(len(band_tasks),
                                                 max_workers)) as pool:
             futures = {}
             for band, files, emin, emax, desc, scale in band_tasks:
-                f = pool.submit(process_band, band, files, data_dir,
+                f = pool.submit(prepare_band, band, files, data_dir,
                                 emin, emax, desc, scale,
                                 native_gdal, runtime, max_workers)
                 futures[f] = band
@@ -1306,43 +1752,85 @@ def process_by_band(
                     print(f"ERROR: band {futures[future]}: {exc}",
                           file=sys.stderr)
                     sys.exit(1)
-                result = future.result()
-                if result is not None:
-                    band_tiles[futures[future]] = result
+                _collect(future.result())
 
-    if not band_tiles:
+    if not sources:
+        print("ERROR: No charts to render", file=sys.stderr)
+        sys.exit(1)
+
+    # Gap fills: consolidated like bands, prioritized between band 2 and
+    # band 3. See prepare_gap_fill_sources() and the `gap_fills:` comment
+    # block in enc-sources.yaml for the rationale (NOAA legacy-ENC
+    # discontinuities being closed by the ENC Rescheming Project).
+    sources.extend(prepare_gap_fill_sources(data_dir, minzoom, maxzoom))
+    sources.sort(key=lambda s: s.priority)
+
+    # Stage 3b: plan the tippecanoe runs and erase finer footprints from
+    # every run that shares zooms with a higher-priority source.
+    runs = plan_render_runs(sources)
+    gdal = GdalRunner(native_gdal, runtime, data_dir)
+    print("\n-- Render plan (finer chart wins on overlap) ----------------------")
+    run_dirs: Dict[str, Path] = {}
+    for run in runs:
+        zr = f"z{run.zoom_range[0]}-{run.zoom_range[1]}"
+        if run.erased_by:
+            print(f"  {run.source.label:<28} {zr:<8} minus "
+                  f"{', '.join(e.label for e in run.erased_by)}")
+        else:
+            print(f"  {run.source.label:<28} {zr}")
+    for run in runs:
+        if run.erased_by:
+            run_dirs[run.stem] = erase_for_run(run, data_dir, gdal,
+                                               max_workers)
+        else:
+            run_dirs[run.stem] = run.source.merged_dir
+
+    # Stage 4: tippecanoe, runs concurrently via threads.
+    tile_dir = data_dir / "tiles"
+    tiles: List[Tuple[float, Path]] = []
+
+    def _tile(run: RenderRun) -> Optional[Path]:
+        return run_tippecanoe_for_source(
+            run_dirs[run.stem], tile_dir, run.stem,
+            run.zoom_range[0], run.zoom_range[1], max_workers=max_workers)
+
+    if len(runs) <= 1 or max_workers <= 1:
+        for run in runs:
+            out = _tile(run)
+            if out is not None:
+                tiles.append((run.source.priority, out))
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(runs),
+                                                max_workers)) as pool:
+            futures = {pool.submit(_tile, run): run for run in runs}
+            for future in as_completed(futures):
+                exc = future.exception()
+                if exc:
+                    print(f"ERROR: {futures[future].stem}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                out = future.result()
+                if out is not None:
+                    tiles.append((futures[future].source.priority, out))
+
+    if not tiles:
         print("ERROR: No tiles produced", file=sys.stderr)
         sys.exit(1)
 
-    # Clip band 1/2 output to the district's regional extent (union of
-    # its band>=3 footprints) — ocean-basin overview cells otherwise put
-    # planet-wide tiles and bounds into every district file.
-    band_tiles = trim_low_bands_to_region(band_tiles)
-    if not band_tiles:
+    # Clip band 1/2 (and gap-fill) output to the district's regional
+    # extent (union of its band>=3 footprints) — ocean-basin overview
+    # cells otherwise put planet-wide tiles and bounds into every
+    # district file.
+    tiles = trim_low_bands_to_region(tiles)
+    if not tiles:
         print("ERROR: No tiles left after district-region clipping",
               file=sys.stderr)
         sys.exit(1)
 
-    # Gap fill: one mbtiles per configured group. See process_gap_fill()
-    # and the `gap_fills:` comment block in enc-sources.yaml for the full
-    # rationale (NOAA legacy-ENC discontinuities being closed by the ENC
-    # Rescheming Project).
-    gap_tile_paths = process_gap_fill(data_dir, minzoom, maxzoom, max_workers)
-
-    # Coarse → fine ordering by band number (band 1 = overview, band 6 = berthing)
-    sorted_bands = sorted(band_tiles)
-    ordered = [band_tiles[b] for b in sorted_bands]
-    if gap_tile_paths:
-        # Slot all fills between band 2 and band 3. tile-join lets later
-        # inputs win on overlap, so this position lets the original band
-        # 3+ outputs win wherever they have data — fills only appear in
-        # tiles the original bands left empty.
-        insert_idx = next((i for i, b in enumerate(sorted_bands) if b > 2),
-                          len(ordered))
-        for p in gap_tile_paths:
-            ordered.insert(insert_idx, p)
-            insert_idx += 1
-    return ordered
+    # Coarse → fine for tile-join. The erase already made the tilesets
+    # disjoint wherever they share a zoom, so the order is cosmetic.
+    tiles.sort(key=lambda t: (t[0], t[1].name))
+    return [p for _, p in tiles]
 
 
 # ---------------------------------------------------------------------------

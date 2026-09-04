@@ -259,13 +259,18 @@ builds:
 #
 # How this works at runtime:
 #   For each group below, s57-to-mbtiles.py (process_gap_fill) takes the
-#   named cells' already-exported GeoJSON and runs an extra tippecanoe
-#   pass at the group's zoom_range. Each fill mbtiles is slotted into
-#   the final tile-join between band 2 and band 3, so the original-band
-#   tippecanoe outputs still win where they have data; the fill only
-#   appears where the original bands are empty. Cells listed below but
-#   not present in the build's ENC zip are silently skipped — so this
-#   list is a global superset, not per-build.
+#   named cells' already-exported GeoJSON and renders it at the group's
+#   zoom_range as its own tileset with priority cellband - 0.1. Finer
+#   wins is enforced BEFORE tiling: at every zoom the band NOAA compiled
+#   for that zoom outranks everything, then finer data; every
+#   higher-ranked chart's footprints are erased from the fill, so the
+#   fill only appears where the natural pipeline has no chart, and a
+#   fill of band N cells is fully erased wherever band N itself renders.
+#   (tile-join itself merges overlapping layers; input order decides
+#   nothing.) Cells listed below but not present in the build's ENC zip
+#   are silently skipped — so this list is a global superset, not
+#   per-build. Fills whose cells are the same band do not erase each
+#   other, so keep such groups geographically disjoint.
 #
 # Adding a new gap:
 #   1. Find a coverage hole at low zoom (typically z=9-10).
@@ -286,9 +291,9 @@ gap_fills:
   - name: gulf_pnw_band2_holes
     description: >
       Coastal areas where NOAA's lower-band cells leave gaps. Filled at
-      every zoom z=9-16 with band 3 detail cells. tile-join lets the
-      original higher-band outputs win where they have data, so this
-      fill only shows up in tiles the natural pipeline left empty.
+      every zoom z=9-16 with band 3 detail cells. Native band 3+ charts
+      are erased from the fill wherever they render, so in practice this
+      fill contributes only at z=9-10 where band 2 is missing.
       Affected areas: South Texas (Brownsville → Matagorda), Louisiana
       (Morgan City → Grand Isle, incl. Houma), Strait of Juan de Fuca /
       Puget Sound.
@@ -347,8 +352,9 @@ gap_fills:
       Filled with band 4 cells across all zooms 9-16. At z=13-14 the
       normal band 4 processing renders the cells; at z=9-12 and z=15-16
       this gap-fill pass puts them into the missing bands' zoom ranges.
-      Where band 5 cells exist (Mount Desert, Lubec) the normal band 5
-      output still wins via tile-join. Visual tradeoff: at z=15-16 the
+      Where band 5 cells exist (Mount Desert, Lubec) their footprints
+      are erased from this fill, so band 5 is the only chart there.
+      Visual tradeoff: at z=15-16 the
       Petit Manan→Cutler strip shows 1:22,000-scale features rendered
       at ~1:8,000 zoom — coarser than ideal but better than empty.
     zoom_range: [9, 16]
@@ -372,8 +378,8 @@ gap_fills:
       are all missing in NOAA's catalog for this stretch; only band 5
       cells exist. Filled with band 5 cells at all zooms 9-16 so they
       render across overview/coastal/approach zooms too. Where the band
-      5 natural pipeline runs (z=15-16), it produces the same data, and
-      tile-join handles the overlap.
+      5 natural pipeline runs (z=15-16) its footprints are erased from
+      this fill, so the same data is not tiled twice.
     zoom_range: [9, 16]
     cells:
       - US5ME3FE

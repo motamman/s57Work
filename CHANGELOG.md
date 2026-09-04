@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- By-band mode shipped two charts in the same tiles at every zoom from 9
+  to 16. The zoom extension and gap fills both relied on tile-join letting
+  a later input win where tilesets overlap; tile-join instead merges
+  same-layer features from all inputs into one layer, with a draw order
+  that is not controllable and differs from tile to tile. Opaque depth
+  areas from the coarser band therefore showed through in tile-shaped
+  patches next to tiles showing the finer band (reported around Block
+  Island, RI). The pipeline now enforces "finer chart wins" itself: before
+  a band is tiled at zooms shared with a higher-priority source, the union
+  of that source's chart footprints (`M_COVR`, `CATCOV=1`) is erased from
+  its features with `ogr2ogr -clipsrc`, so a coarse chart is present only
+  where no finer chart has coverage, as on an ECDIS. Each band now yields
+  a native-zoom tileset and, where it overlaps a finer band, an erased
+  extended-zoom tileset (`<band>_z<a>-<b>.minus-<finer>.mbtiles`).
+- Resume: a cell whose GeoJSON directory held an orphan layer file (an
+  object class the cell no longer has after an ER update, or a leftover
+  from an older export) never passed the freshness check, so it was
+  re-exported on every run, which in turn re-consolidated and re-tiled
+  its whole band. The export now clears all of a cell's outputs before
+  rewriting it. In the 01CGD data 15 cells were in this state, forcing
+  bands 3-5 to rebuild on every resume.
+- Layer names were taken from the part of the filename before the first
+  underscore, which folded every S-57 meta layer (`M_COVR`, `M_QUAL`,
+  `M_NSYS`, `M_SDAT`, `M_VDAT`, `M_NPUB`) into one tile layer called `M`
+  and `TS_FEB` into `TS`. Only a trailing NOAA cell name is stripped now,
+  and stale merged layer files from the old naming are removed on the next
+  consolidation.
+- `check-tile-overlap.py`: diagnostic that reports tile addresses shared
+  between tilesets per zoom and decodes a tile (or a lon/lat at several
+  zooms) across all of them, showing which layers each contributes.
+
+### Changed
+- Gap fills are render sources with priority `cellband - 0.1` and go
+  through the same erase rule. At each zoom the band NOAA compiled for
+  that zoom outranks everything, then finer data wins, so a fill appears
+  only where the natural pipeline has no chart and is fully erased
+  wherever its own band renders. Fills of the same cell band do not erase
+  each other.
+- Runs whose every layer was erased are skipped instead of being handed
+  to tippecanoe, which exits non-zero on empty input.
+- GDAL must provide the SQLite dialect's spatial functions (`ST_Union`,
+  `ST_Difference`) for by-band mode: a build with SpatiaLite or GEOS.
+  Ubuntu `gdal-bin` (CI) and Homebrew `gdal` qualify. The alpine-small
+  container image has not been verified.
+- `trim_low_bands_to_region` operates on a (priority, path) list so a
+  band can contribute more than one tileset.
+
 ## [0.6.0] - 2026-09-02
 
 ### Added
