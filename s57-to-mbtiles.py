@@ -2392,6 +2392,8 @@ def process_source(
             print(f"ERROR: No .000 files in {source.path}", file=sys.stderr)
             sys.exit(1)
         print(f"Found {len(enc_files)} ENC file(s)")
+        # Cells cancelled or removed since the last run must not linger.
+        _remove_orphan_cells(geojson_dir, {e.stem.upper() for e in enc_files})
         export_to_geojson(
             enc_dir, geojson_dir, enc_files, label=label,
             native_gdal=native_gdal, runtime=runtime,
