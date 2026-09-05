@@ -47,7 +47,7 @@ For each band or source, the script runs these stages in order:
 
 ```
 1. Extract    ZIPs / copy directories        → data/enc/
-2. Find       every .000 ENC file recursively
+2. Find       every .000 ENC file recursively; drop cancelled cells (DSID EDTN=0) → data/cancelled-cells.json
 3. GDAL       ogr2ogr → one GeoJSON per S-57 layer per cell → data/geojson/
 3b. Resolve   (by-band) clip legacy cells under reschemed cells of the same band → data/geojson/<band>.resolved/
 4. Consolidate merge per-cell GeoJSON into one file per layer → data/merged/
@@ -125,7 +125,7 @@ python3 s57-to-mbtiles.py CT_ENCs.zip RI_ENCs.zip MA_ENCs.zip NY_ENCs.zip --by-b
 How it works:
 
 1. Extracts all ZIPs / copies all directories into a staging area (`data/enc/all/input0`, `input1`, etc.)
-2. Finds every `.000` file recursively
+2. Finds every `.000` file recursively and drops **cancelled cells**. NOAA withdraws a cell with an S-57 cancellation update (a DSID-only update setting the edition number to 0) and, as of September 2026, still ships the withdrawn cells in the district zips. GDAL applies the update but keeps the data, so without this step the pipeline renders charts that no longer exist on top of their replacements. Excluded cells are listed in `data/cancelled-cells.json`; the DSID reads are cached in `data/enc/.cell-editions.json`.
 3. Groups files by NOAA usage band (the first digit after `US` in the filename)
 4. Runs GDAL → consolidate → tippecanoe separately for each band, bands in parallel. Each band starts at its native minzoom and renders **two zoom levels past its native ceiling**, capped at `--maxzoom`, so wherever no finer chart exists the best available band still fills the deeper zooms:
 
@@ -139,7 +139,7 @@ How it works:
 | 6 | Berthing | ~1:3,000 | z17–z18 | needs `--maxzoom 17` or higher |
 
    **Finer chart wins where bands overlap.** tile-join does not do this for you: when two inputs have the same tile and layer it merges their features into one layer, so the pipeline enforces it before tiling. At every zoom where a band shares zooms with a finer band (band 2's z11–12 with band 3, band 3's z13–14 with band 4, band 4's z15–16 with band 5), the union of the finer band's chart footprints (`M_COVR`, `CATCOV=1`) is erased from the coarser band's features with `ogr2ogr -clipsrc`, into `data/merged/<band>.minus-<finer>/`. Those zooms are tiled from the erased copy; the band's native zooms are tiled from the untouched merged layers. A coarse chart therefore appears only where no finer chart has coverage, exactly as an ECDIS displays it, and the seams follow chart boundaries rather than tile edges. This step needs GDAL with SpatiaLite/GEOS spatial SQL (Ubuntu `gdal-bin`, Homebrew `gdal`).
-   **Same-band overlaps are resolved before consolidation.** NOAA's rescheming currently ships legacy and reschemed cells of one band that overlap with data in both (see `docs/SAME-BAND-OVERLAP.md`). Within a band the reschemed cell wins: every layer of the legacy cell is clipped under the reschemed cells' `M_COVR` footprints into `data/geojson/<band>.resolved/` and those copies replace the originals at consolidation. Cells are classified by NOAA's naming convention, which is unambiguous for bands 1-2 only; overlaps in bands 3-6 are reported as warnings and left alone. Every pair is recorded in `data/merged/<band>/.same-band-overlaps.json`.
+   **Remaining same-band overlaps are detected before consolidation.** With cancelled cells gone, the only live-versus-live overlap in NOAA's current data is the legacy `US2EC03M` under the reschemed `US2ATL*` cells (see `docs/SAME-BAND-OVERLAP.md`). Where exactly one cell of an overlapping pair carries an Annex A band 1-2 region code, that cell wins and the other is clipped under its `M_COVR` footprint into `data/geojson/<band>.resolved/`; every other pair is reported as a warning and left alone. All pairs are recorded in `data/merged/<band>/.same-band-overlaps.json`.
 5. Clips band 1/2 output to the district's region. Overview cells can span an entire ocean basin (`US1PO02M` covers the whole North Pacific), which would otherwise put planet-wide tiles and −180..180 bounds into every district file. The region is the union of the district's own band 3+ chart footprints as a z11 tile mask, dilated by one tile. The clipped result is written to a separate `bandN-*.region.mbtiles`; the band's tippecanoe output is never modified, so resume stays correct if a later run adds inputs that widen the region.
 6. Builds any gap fills configured in `enc-sources.yaml` (see below).
 7. Merges everything with tile-join. Gap fills go through the same erase rule with priority `cellband − 0.1`. At each zoom the band NOAA compiled for that zoom wins outright wherever it has coverage; elsewhere finer data wins. A fill therefore shows only in the holes, and a fill of band N cells is fully erased wherever band N itself renders, so nothing is tiled twice.
@@ -229,6 +229,7 @@ To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the 
 
 ### What gets skipped on a re-run
 
+- **Cancellation check**: one `ogrinfo` DSID read per cell, cached on the cell's file times; only new or updated cells are re-read.
 - **GDAL**: a cell is re-exported only if its `.000` or any update file is newer than its existing GeoJSON.
 - **Same-band overlap resolution**: detection is cached on the cells' `M_COVR` exports and reruns only when one changes; a clipped legacy layer is redone only if its source file or the clip polygon is newer. Bands with no resolvable pair cost nothing.
 - **Consolidate**: a merged layer is rebuilt only if any of its per-cell inputs (or its clipped replacement) is newer, or the heavy-layer minzoom config changed.

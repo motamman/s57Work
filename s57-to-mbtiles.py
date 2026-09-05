@@ -28,6 +28,7 @@ SKIP GDAL (use existing GeoJSON):
 ─────────────────────────────────────────────────────────────────────────────
 PIPELINE (per band or source)
   1. Extract ZIPs → data/enc/
+  1b. Drop cancelled cells (S-57 DSID EDTN=0 after updates) → data/cancelled-cells.json
   2. ogr2ogr (native or container) → data/geojson/
   2b. (by-band) Clip legacy cells under reschemed cells of the same band
       → data/geojson/<band>.resolved/  (reschemed cell wins)
@@ -462,6 +463,100 @@ def group_by_band(enc_files: List[Path]) -> Dict[int, List[Path]]:
         band = enc_band(f)
         groups.setdefault(band if band is not None else 0, []).append(f)
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Cancelled cells
+# ---------------------------------------------------------------------------
+# S-57 Appendix B.1 §5.7: "In order to delete a data set, an update cell
+# file is created, containing only the Data Set General Information record
+# with the DSID field. The Edition Number [EDTN] subfield must be set to 0.
+# This message is only used to cancel a base cell file." NOAA's district
+# zips (checked 2026-09-05, all eight active districts) still ship 190
+# cells that carry such a cancellation update — legacy cells withdrawn as
+# their reschemed replacements were released. GDAL applies the update on
+# open and reports DSID_EDTN = 0, but keeps every feature, so without this
+# check the pipeline renders withdrawn charts on top of their replacements
+# (docs/SAME-BAND-OVERLAP.md). An ECDIS removes a cancelled cell; so do we.
+
+def _cell_files(enc: Path) -> List[Path]:
+    """The base .000 and every .NNN update file of a cell."""
+    return sorted(enc.parent.glob(f"{enc.stem}.[0-9][0-9][0-9]"))
+
+
+def read_cell_dsid(enc: Path, gdal: "GdalRunner") -> Dict[str, Optional[str]]:
+    """EDTN/UPDN/ISDT from the DSID record with updates applied."""
+    res = subprocess.run(gdal.cmd(["ogrinfo", "-ro", "-q", "-al", enc, "DSID"]),
+                         capture_output=True, text=True)
+    out: Dict[str, Optional[str]] = {"EDTN": None, "UPDN": None, "ISDT": None}
+    for key in out:
+        m = re.search(rf"DSID_{key} \(\w+\) = (\S+)", res.stdout)
+        if m:
+            out[key] = m.group(1)
+    return out
+
+
+def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
+                         gdal: "GdalRunner", max_workers: int,
+                         record_path: Path) -> List[Path]:
+    """Return enc_files without cancelled cells (DSID EDTN = 0 after
+    updates). Results are cached in data/enc/.cell-editions.json keyed on
+    the newest mtime among the cell's files, so only new or updated cells
+    cost an ogrinfo call. Writes record_path listing the cancelled cells."""
+    cache_path = data_dir / "enc" / ".cell-editions.json"
+    try:
+        cache = json.loads(cache_path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+
+    def stamp(enc: Path) -> int:
+        return max(f.stat().st_mtime_ns for f in _cell_files(enc) + [enc])
+
+    todo = [e for e in enc_files
+            if cache.get(str(e), {}).get("stamp") != stamp(e)]
+    if todo:
+        print(f"Reading DSID of {len(todo)}/{len(enc_files)} cell(s) for "
+              "cancellation status...")
+
+        def one(e: Path):
+            return str(e), dict(read_cell_dsid(e, gdal), stamp=stamp(e))
+
+        with ThreadPoolExecutor(max_workers=max(1, max_workers) * 2) as pool:
+            for key, val in pool.map(one, todo):
+                cache[key] = val
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, indent=0, sort_keys=True))
+
+    kept: List[Path] = []
+    cancelled = []
+    for e in enc_files:
+        info = cache.get(str(e), {})
+        if info.get("EDTN") == "0":
+            cancelled.append({"cell": e.stem, "band": enc_band(e),
+                              "cancel_update": info.get("UPDN"),
+                              "cancelled_on": info.get("ISDT"),
+                              "path": str(e)})
+        else:
+            kept.append(e)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(
+        {"rule": "S-57 App. B.1 5.7: DSID EDTN=0 after updates = cancelled",
+         "cancelled": sorted(cancelled, key=lambda c: c["cell"])},
+        indent=1))
+    if cancelled:
+        names = " ".join(c["cell"] for c in sorted(cancelled, key=lambda c: c["cell"]))
+        print(f"Excluding {len(cancelled)} cancelled cell(s) (S-57 EDTN=0): {names}")
+    return kept
+
+
+def _remove_orphan_cells(geojson_dir: Path, wanted_cells: set):
+    """Delete per-cell exports of cells no longer in the inventory (cancelled
+    since the last run, or gone from NOAA's zip) so they cannot reach
+    consolidation."""
+    for f in geojson_dir.glob("*_US*.geojson"):
+        cell = cell_name_from_stem(f.stem)
+        if cell and cell not in wanted_cells:
+            f.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -1660,7 +1755,6 @@ def _prepare_gap_fill_group(
 # is recorded in data/merged/bandN/.same-band-overlaps.json for reporting
 # to NOAA; once NOAA cuts back the legacy cells the rule has nothing to do.
 
-LEGACY_CELL_RE = re.compile(r'^US\d[A-Z]{2}\d{2}M$', re.IGNORECASE)
 RESCHEMED_REGION_CODES: Dict[int, set] = {
     1: {"GLB"},
     2: {"ARC", "ANT", "ATL", "GRL", "GOM", "PAC"},
@@ -1669,18 +1763,21 @@ RESCHEMED_REGION_CODES: Dict[int, set] = {
 # up); the edge slivers legitimately shared by adjacent cells measure
 # ~2e-6 deg². 1e-4 deg² is about 1 km² at mid latitudes.
 SAME_BAND_OVERLAP_MIN_AREA = 1e-4
-SAME_BAND_RULE = "reschemed-wins-v1"
+SAME_BAND_RULE = "reschemed-wins-v2"
 
 
 def classify_cell(name: str) -> str:
-    """'legacy', 'reschemed' or 'unknown' from a NOAA cell name."""
+    """'reschemed' when the name carries a Design Handbook Annex A region
+    code for band 1 or 2 (GLB; ARC ANT ATL GRL GOM PAC), else 'other'.
+    Only used for LIVE cells that overlap: cancelled cells are dropped at
+    inventory (drop_cancelled_cells), which covered 444 of the 448 overlap
+    pairs measured on 2026-09-05. The remaining live-vs-live case is the
+    legacy US2EC03M under reschemed US2ATL* cells."""
     name = name.upper()
-    if LEGACY_CELL_RE.match(name):
-        return "legacy"
     band = enc_band(Path(name))
     if band in RESCHEMED_REGION_CODES and name[3:6] in RESCHEMED_REGION_CODES[band]:
         return "reschemed"
-    return "unknown"
+    return "other"
 
 
 @dataclass
@@ -1798,8 +1895,8 @@ def plan_same_band_resolution(pairs: List[OverlapPair]):
             slivers.append(p)
             continue
         ka, kb = classify_cell(p.a), classify_cell(p.b)
-        if {ka, kb} == {"legacy", "reschemed"}:
-            legacy, resch = (p.a, p.b) if ka == "legacy" else (p.b, p.a)
+        if {ka, kb} == {"other", "reschemed"}:
+            legacy, resch = (p.a, p.b) if ka == "other" else (p.b, p.a)
             resolved.setdefault(legacy, []).append(resch)
         else:
             unresolved.append((p, f"{ka} x {kb}"))
@@ -2021,6 +2118,9 @@ def prepare_band(
                 shutil.copy2(src, dest)
         band_cells.append(band_enc_dir / enc_file.name)
 
+    # Cells cancelled or removed since the last run must not linger.
+    _remove_orphan_cells(band_geojson_dir, {c.stem.upper() for c in band_cells})
+
     # Stage 2: GDAL export
     export_to_geojson(
         band_enc_dir, band_geojson_dir, band_cells, label=label,
@@ -2091,6 +2191,9 @@ def process_by_band(
 
     all_enc = find_enc_files(staging_dir)
     print(f"Total ENC files found: {len(all_enc)}")
+    gdal_probe = GdalRunner(native_gdal, runtime, data_dir)
+    all_enc = drop_cancelled_cells(all_enc, data_dir, gdal_probe, max_workers,
+                                   data_dir / "cancelled-cells.json")
 
     by_band = group_by_band(all_enc)
 
@@ -2282,6 +2385,9 @@ def process_source(
         print(f"\n[{label}] z{source.minzoom}-{source.maxzoom}  {source.path}")
         stage_input(source.path, enc_dir, data_dir / "zips")
         enc_files = find_enc_files(enc_dir)
+        enc_files = drop_cancelled_cells(
+            enc_files, data_dir, GdalRunner(native_gdal, runtime, data_dir),
+            max_workers, data_dir / f"cancelled-cells-{safe_label}.json")
         if not enc_files:
             print(f"ERROR: No .000 files in {source.path}", file=sys.stderr)
             sys.exit(1)

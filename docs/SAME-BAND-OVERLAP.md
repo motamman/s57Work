@@ -1,7 +1,8 @@
 # Same-band cell overlap in NOAA ENCs (rescheming transition)
 
-Status: documented 2026-09-04; handled by the pipeline's Stage 2b (same-band
-overlap resolution) since the same day. See "Mechanism" below.
+Status: root cause found 2026-09-05 (cancelled cells shipped in NOAA's zips,
+see below); handled by dropping cancelled cells at inventory plus Stage 2b
+for the one remaining live-versus-live overlap. See "Mechanism".
 
 ## The symptom
 
@@ -65,6 +66,71 @@ same beacon `LNAM 022602021B320032` at the same coordinates in both files
 1,499,999 in the legacy cell). The two `M_COVR` `LNAM`s in the raw files are
 exactly the two seen in the Chicago tile. The pipeline reproduces the
 overlap; it does not create it.
+
+## The actual cause: cancelled cells are still in the district zips (2026-09-05)
+
+Checked in the raw NOAA zips for all eight districts, not in our tiles.
+Every legacy cell in an overlapping pair has been **cancelled by NOAA** in
+the way S-57 prescribes. S-57 Appendix B.1 §5.7:
+
+> "In order to delete a data set, an update cell file is created,
+> containing only the Data Set General Information record with the 'Data
+> Set Identifier' [DSID] field. The 'Edition Number' [EDTN] subfield must
+> be set to 0. This message is only used to cancel a base cell file."
+
+That is exactly what the last update file of each of these cells is: about
+400 bytes, no feature layers, edition number 0. Examples from the zips:
+
+| Cell | Base edition | Last update | Cancelled on |
+|---|---|---|---|
+| US3OR01M | 39 | .007, DSID only, EDTN 0 | 2026-04-09 |
+| US5WA13M | 41 | .001, DSID only, EDTN 0 | 2026-05-18 |
+| US2MI01M | 11 | .010, DSID only, EDTN 0 | 2026-05-07 |
+| US2EC04M | 41 | cancelled (EDTN 0 after updates) | 2026 |
+
+GDAL applies update files on open by default ("The S-57 reader will
+normally read and apply all updates files to the in memory version of the
+base file on the fly", `UPDATES=APPLY`), so `DSID_EDTN` reads 0 for these
+cells, but the driver does not drop the features of a cancelled cell. An
+ECDIS removes the cell; our pipeline kept rendering it.
+
+Count across the eight district zips (5,114 cells):
+
+| District | Cells | Cancelled | Flagged overlap pairs | Pairs with exactly one cancelled side |
+|---|---|---|---|---|
+| 01 | 874 | 6 | 34 | 31 |
+| 05 | 914 | 47 | 61 | 60 |
+| 07 | 1032 | 12 | 55 | 55 |
+| 08 | 819 | 2 | 1 | 1 |
+| 09 | 964 | 9 | 13 | 13 |
+| 11 | 436 | 43 | 83 | 83 |
+| 13 | 561 | 34 | 95 | 95 |
+| 14 | 514 | 37 | 106 | 106 |
+
+444 of 448 overlapping pairs are a cancelled cell against a live one,
+including every band 3-5 pair and every odd-named Pacific-territory pair.
+The four exceptions are one cell: **US2EC03M** "Cape Sable to Cape
+Hatteras" (edition 39, live) overlapping the live reschemed cells
+US2ATLPC, US2ATLPD, US2ATLPF and US2ATLQD. That is the only genuine
+live-versus-live transition overlap in the data.
+
+Consequences:
+
+- The correct primary rule is the standard's: **a cell whose edition
+  number is 0 after updates is cancelled and is excluded from the build.**
+  No name patterns, no overlap heuristics; it applies to every band and
+  self-retires as NOAA removes the cancelled files from its zips.
+- Name-based classification would have been wrong in both directions:
+  dozens of legacy-named cells are live (e.g. 24 Great Lakes band 5 cells
+  at editions 4-7) and several cancelled cells have non-legacy names
+  (US1EEZ1M, US2FAS01, US409860).
+- The catalog's "edition" is the last live edition (US2EC04M shows 41.1
+  there while its shipped data is cancelled), so the catalog cannot be
+  used to detect cancellation; only the DSID after updates can.
+- The Stage 2b overlap detection stays useful as a check for live-vs-live
+  overlaps; after cancelled cells are dropped it should find exactly the
+  US2EC03M pairs, which need a policy decision (reschemed cell wins, or
+  leave both).
 
 ## What the standards say
 
@@ -161,12 +227,17 @@ producer to have done.
 
 Runs per band between the GDAL export and consolidation, in by-band mode.
 
-1. **Classify** every cell by name. Legacy: `^US\d[A-Z]{2}\d{2}M$`
-   (US2EC03M, US2MI01M, US3EC11M). Reschemed: characters 4-6 are a Design
-   Handbook Annex A region code for the band — `GLB` for band 1, `ARC ANT
-   ATL GRL GOM PAC` for band 2. Anything else is `unknown`. Bands 3-6 reuse
-   state codes that legacy harbour cells also used (US5MA1SK vs US5MA1AA),
-   so their pairs are never classified and never erased.
+0. **Drop cancelled cells first** (`drop_cancelled_cells`, at inventory,
+   all modes). A cell whose DSID edition number is 0 after updates has
+   been cancelled per S-57 App. B.1 §5.7 and is excluded from the build,
+   listed in `data/cancelled-cells.json`. This alone removes 444 of the
+   448 overlaps measured on 2026-09-05.
+1. **Classify** the remaining live cells by name: `reschemed` when
+   characters 4-6 are a Design Handbook Annex A region code for band 1
+   (`GLB`) or band 2 (`ARC ANT ATL GRL GOM PAC`), else `other`. A pair is
+   resolved only when exactly one side is `reschemed`; today that is the
+   live legacy `US2EC03M` under four live `US2ATL*` cells. Everything else
+   (both other, both reschemed) is warned and recorded, never erased.
 2. **Detect** overlaps from the per-cell `M_COVR CATCOV=1` polygons: a
    bounding-box pre-filter in Python, then one GDAL SQLite-dialect
    self-join (`ST_Intersects`, `SUM(ST_Area(ST_Intersection))`) for the
@@ -266,5 +337,9 @@ district zips inherits the overlap.
 - NOAA ENC Direct to GIS help: <https://nauticalcharts.noaa.gov/learn/encdirect/>
 - s57-tiler (S-57 to vector tiles for freeboard-sk):
   <https://github.com/wdantuma/s57-tiler>
+- IHO S-57 Appendix B.1 §5.7 (data set cancellation: update with DSID only, EDTN = 0):
+  <https://iho.int/uploads/user/pubs/standards/s-57/20ApB1.pdf>
+- GDAL S-57 driver (updates applied on the fly, `UPDATES=APPLY`):
+  <https://gdal.org/en/stable/drivers/vector/s57.html>
 - Measurements: `verify-r2-charts.py` report of 2026-09-04 and
   `check-tile-duplicates.py` on the published district files.

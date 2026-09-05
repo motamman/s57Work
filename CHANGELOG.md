@@ -22,6 +22,16 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where no finer chart has coverage, as on an ECDIS. Each band now yields
   a native-zoom tileset and, where it overlaps a finer band, an erased
   extended-zoom tileset (`<band>_z<a>-<b>.minus-<finer>.mbtiles`).
+- Cancelled cells were being built. NOAA withdraws a cell with an S-57
+  cancellation update (App. B.1 §5.7: a DSID-only update file with edition
+  number 0) and still ships the withdrawn cells, cancellation included, in
+  its district zips: 190 cells across the eight active districts on
+  2026-09-05. GDAL applies the update and reports edition 0 but keeps the
+  features, so the pipeline rendered withdrawn legacy charts under and over
+  their reschemed replacements. This was the cause of 444 of the 448
+  same-band overlaps measured in the published files. Cells with edition 0
+  after updates are now dropped at inventory (`drop_cancelled_cells`),
+  listed in `data/cancelled-cells.json`, and their stale exports removed.
 - Same-band duplicates: NOAA's rescheming ships legacy and reschemed cells
   of one usage band that overlap with `M_COVR CATCOV=1` coverage in both and
   carry the same objects (an IHO S-57 App. B.1 §2.2 violation; verified in
@@ -31,10 +41,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it before consolidation: within a band the reschemed cell wins (Design
   Handbook Annex A region codes, unambiguous for bands 1-2), and every layer
   of the legacy cell is clipped under the reschemed footprints into
-  `data/geojson/<band>.resolved/`. Issue date and compilation scale were
-  rejected as rules because both pick the legacy cell in measured cases.
-  Bands 3-6 are detected and warned only. Each overlap is recorded in
-  `data/merged/<band>/.same-band-overlaps.json` for reporting to NOAA.
+  `data/geojson/<band>.resolved/`. With cancelled cells excluded this
+  applies to one known case, legacy `US2EC03M` under the reschemed
+  `US2ATL*` cells; a pair is resolved only when exactly one side carries
+  an Annex A band 1-2 region code, and every other overlap is a warning.
+  Each overlap is recorded in `data/merged/<band>/.same-band-overlaps.json`
+  for reporting to NOAA.
   Research and evidence in `docs/SAME-BAND-OVERLAP.md`.
 - Resume: a cell whose GeoJSON directory held an orphan layer file (an
   object class the cell no longer has after an ER update, or a leftover
