@@ -384,34 +384,31 @@ def _mbtiles_zoom_range(path: Path) -> Optional[Tuple[int, int]]:
 
 def _cell_marker(geojson_dir: Path, cell: str) -> Path:
     """Completion marker written after the LAST layer of a cell is
-    exported. Without it an export interrupted mid-cell (killed run, lost
-    CI runner) leaves a partial layer set whose files are all newer than
-    the source, and cell_outputs_fresh would accept the cell as complete
-    forever (2026-09-05: 39 cells missing most layers, SOUNDG included,
-    after a killed run was resumed)."""
+    exported, holding the cell version (cell_version) the export was made
+    from. Two things it guarantees: an export interrupted mid-cell (killed
+    run, lost CI runner) has no marker and is redone (2026-09-05: 39 cells
+    missing most layers, SOUNDG included, after a killed run was resumed);
+    and freshness is decided by the cell's own edition/update numbers, not
+    by file times, which unzip, copy and re-download all rewrite."""
     return geojson_dir / f".{cell}.exported"
 
 
 def cell_outputs_fresh(enc_path: Path, geojson_dir: Path,
-                       multi_file: bool) -> bool:
-    """True if the cell's completion marker and all its GeoJSON outputs
-    are newer than every source file (.000 + any .001..NNN ER updates in
-    the same directory)."""
+                       multi_file: bool, version: str) -> bool:
+    """True if the cell was exported from exactly this version (marker
+    content == version) and its outputs are still there."""
     cell_stem = enc_path.stem
-    sources = list(enc_path.parent.glob(f"{cell_stem}.*"))
-    if not sources:
-        return False
-    source_mtime = max(s.stat().st_mtime for s in sources)
     marker = _cell_marker(geojson_dir, cell_stem)
-    if not marker.exists() or marker.stat().st_mtime < source_mtime:
+    try:
+        if version == "unknown" or marker.read_text().strip() != version:
+            return False
+    except OSError:
         return False
-    if multi_file:
-        outputs = list(geojson_dir.glob(f"*_{cell_stem}.geojson"))
-    else:
-        outputs = list(geojson_dir.glob("*.geojson"))
-    if not outputs:
-        return False
-    return all(o.stat().st_mtime >= source_mtime for o in outputs)
+    pattern = f"*_{cell_stem}.geojson" if multi_file else "*.geojson"
+    return any(True for _ in geojson_dir.glob(pattern))
+
+
+EXPORT_ERROR_LOG = ".export-errors.log"
 
 
 # ---------------------------------------------------------------------------
@@ -518,13 +515,14 @@ def read_cell_dsid(enc: Path, gdal: "GdalRunner") -> Dict[str, Optional[str]]:
     return out
 
 
-def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
-                         gdal: "GdalRunner", max_workers: int,
-                         record_path: Path) -> List[Path]:
-    """Return enc_files without cancelled cells (DSID EDTN = 0 after
-    updates). Results are cached in data/enc/.cell-editions.json keyed on
-    the newest mtime among the cell's files, so only new or updated cells
-    cost an ogrinfo call. Writes record_path listing the cancelled cells."""
+def read_cell_versions(enc_files: List[Path], data_dir: Path,
+                       gdal: "GdalRunner", max_workers: int,
+                       why: str = "") -> Dict[Path, Dict[str, Optional[str]]]:
+    """DSID EDTN/UPDN/ISDT of every cell, with updates applied. Cached in
+    data/enc/.cell-editions.json keyed by cell name and the newest mtime
+    among the cell's files (shutil.copy2 preserves mtimes, so the band
+    copies prepare_band makes hit the staging entries), so only new or
+    updated cells cost an ogrinfo call."""
     cache_path = data_dir / "enc" / ".cell-editions.json"
     try:
         cache = json.loads(cache_path.read_text())
@@ -534,25 +532,47 @@ def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
     def stamp(enc: Path) -> int:
         return max(f.stat().st_mtime_ns for f in _cell_files(enc) + [enc])
 
+    def key(enc: Path) -> str:
+        return enc.stem.upper()
+
     todo = [e for e in enc_files
-            if cache.get(str(e), {}).get("stamp") != stamp(e)]
+            if cache.get(key(e), {}).get("stamp") != stamp(e)]
     if todo:
-        print(f"Reading DSID of {len(todo)}/{len(enc_files)} cell(s) for "
-              "cancellation status...")
+        print(f"Reading DSID of {len(todo)}/{len(enc_files)} cell(s)"
+              f"{' for ' + why if why else ''}...")
 
         def one(e: Path):
-            return str(e), dict(read_cell_dsid(e, gdal), stamp=stamp(e))
+            return key(e), dict(read_cell_dsid(e, gdal), stamp=stamp(e))
 
         with ThreadPoolExecutor(max_workers=max(1, max_workers) * 2) as pool:
-            for key, val in pool.map(one, todo):
-                cache[key] = val
+            for k, val in pool.map(one, todo):
+                cache[k] = val
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, indent=0, sort_keys=True))
+    return {e: cache.get(key(e), {}) for e in enc_files}
 
+
+def cell_version(info: Dict[str, Optional[str]]) -> str:
+    """The cell's published state, 'EDTN.UPDN' (e.g. '62.0'): the S-57
+    edition and update numbers after ER updates are applied. It changes
+    whenever NOAA changes the cell, and only then — the export freshness
+    key. 'unknown' when the DSID could not be read."""
+    if not info.get("EDTN"):
+        return "unknown"
+    return f"{info['EDTN']}.{info.get('UPDN') or 0}"
+
+
+def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
+                         gdal: "GdalRunner", max_workers: int,
+                         record_path: Path) -> List[Path]:
+    """Return enc_files without cancelled cells (DSID EDTN = 0 after
+    updates). Writes record_path listing the cancelled cells."""
+    versions = read_cell_versions(enc_files, data_dir, gdal, max_workers,
+                                  "cancellation status")
     kept: List[Path] = []
     cancelled = []
     for e in enc_files:
-        info = cache.get(str(e), {})
+        info = versions[e]
         if info.get("EDTN") == "0":
             cancelled.append({"cell": e.stem, "band": enc_band(e),
                               "cancel_update": info.get("UPDN"),
@@ -821,15 +841,21 @@ def export_to_geojson(
     native_gdal: bool = True,
     runtime: Optional[str] = None,
     max_workers: int = 1,
+    data_dir: Optional[Path] = None,
 ) -> List[Path]:
     tag = f"[{label}] " if label else ""
     multi_file = len(enc_files) > 1
+    data_dir = data_dir or DATA_DIR
+    gdal = GdalRunner(native_gdal, runtime, data_dir)
 
-    # Per-cell freshness: only re-export cells whose source(s) are newer
-    # than their existing GeoJSON outputs.
+    # Per-cell freshness: re-export a cell only when its edition/update
+    # numbers differ from those its existing export was made from.
+    infos = read_cell_versions(enc_files, data_dir, gdal, max_workers,
+                               "export freshness")
+    versions = {f: cell_version(infos[f]) for f in enc_files}
     cells_to_process = [
         f for f in enc_files
-        if not cell_outputs_fresh(f, geojson_dir, multi_file)
+        if not cell_outputs_fresh(f, geojson_dir, multi_file, versions[f])
     ]
 
     if not cells_to_process:
@@ -841,12 +867,15 @@ def export_to_geojson(
     print(f"{tag}GDAL: converting {len(cells_to_process)}/{len(enc_files)} "
           f"cell(s) to GeoJSON...")
 
+    error_log = geojson_dir / EXPORT_ERROR_LOG
+    error_log.write_text("")
     if native_gdal:
         _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
-                       tag, max_workers)
+                       tag, max_workers, versions)
     else:
         _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
-                          multi_file, tag, label)
+                          multi_file, tag, label, versions)
+    _report_export_errors(tag, error_log)
 
     valid = []
     for f in list(geojson_dir.glob("*.geojson")):
@@ -859,16 +888,45 @@ def export_to_geojson(
     return valid
 
 
+def _report_export_errors(tag: str, error_log: Path):
+    """ogr2ogr/ogrinfo failures are per layer and used to vanish; a layer
+    that failed to export is a silent hole in the chart. Every failure is
+    appended to EXPORT_ERROR_LOG in the GeoJSON dir; this prints the count
+    and the first few."""
+    try:
+        lines = [ln for ln in error_log.read_text().splitlines() if ln.strip()]
+    except OSError:
+        return
+    if not lines:
+        return
+    print(f"{tag}WARNING: {len(lines)} GDAL export failure(s), see "
+          f"{error_log}", file=sys.stderr)
+    for ln in lines[:5]:
+        print(f"{tag}  {ln[:200]}", file=sys.stderr)
+
+
+def _log_export_error(error_log: Path, lock, text: str):
+    with lock:
+        with open(error_log, "a") as fh:
+            fh.write(text.rstrip() + "\n")
+
+
 def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
-                   tag, max_workers):
+                   tag, max_workers, versions: Dict[Path, str]):
+    import threading
     total = len(cells_to_process)
     done = [0]
+    error_log = geojson_dir / EXPORT_ERROR_LOG
+    lock = threading.Lock()
 
     def process_enc(enc: Path):
         name = enc.stem
         result = subprocess.run(
             ["ogrinfo", "-so", str(enc)], capture_output=True, text=True)
         if result.returncode != 0:
+            err = (result.stderr or "").strip().splitlines()
+            _log_export_error(error_log, lock,
+                              f"{name}: ogrinfo failed: {err[-1] if err else '?'}")
             return
 
         layers = []
@@ -898,8 +956,12 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
                 cmd.extend(["-oo", "SPLIT_MULTIPOINT=YES",
                             "-oo", "ADD_SOUNDG_DEPTH=YES"])
             cmd.extend([str(outpath), str(enc), layer])
-            subprocess.run(cmd, capture_output=True)
-        _cell_marker(geojson_dir, name).touch()
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0 or not outpath.exists():
+                err = (r.stderr or "").strip().splitlines()
+                _log_export_error(error_log, lock, f"{name} {layer}: "
+                                  f"{err[-1] if err else 'no output'}")
+        _cell_marker(geojson_dir, name).write_text(versions[enc] + "\n")
 
         done[0] += 1
         print(f"{tag}[{done[0]}/{total}] {name}")
@@ -921,7 +983,7 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
 
 
 def _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
-                      multi_file, tag, label):
+                      multi_file, tag, label, versions: Dict[Path, str]):
     skip_case = "|".join(SKIP_LAYERS)
     name_template = "${layer}_${name}" if multi_file else "${layer}"
     # Same orphan cleanup as _export_native (see comment there).
@@ -952,10 +1014,10 @@ for rel in $cells; do
     if [ "$layer" = "SOUNDG" ]; then
       ogr2ogr -f GeoJSON -oo SPLIT_MULTIPOINT=YES -oo ADD_SOUNDG_DEPTH=YES \
         -oo LIST_AS_STRING=YES \
-        "/output/$outname.geojson" "$enc" "$layer" 2>/dev/null || true
+        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"
     else
       ogr2ogr -f GeoJSON -oo LIST_AS_STRING=YES \
-        "/output/$outname.geojson" "$enc" "$layer" 2>/dev/null || true
+        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"
     fi
   done
   touch "/output/.$name.exported"
@@ -973,6 +1035,12 @@ echo "Export complete"
     if result.returncode != 0:
         print(f"ERROR: GDAL export failed ({label})", file=sys.stderr)
         sys.exit(1)
+    # The container touches a marker per completed cell; stamp the
+    # version into every marker it left behind.
+    for enc in cells_to_process:
+        marker = _cell_marker(geojson_dir, enc.stem)
+        if marker.exists():
+            marker.write_text(versions[enc] + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2396,7 +2464,8 @@ def prepare_band(
     # Stage 2: GDAL export
     export_to_geojson(
         band_enc_dir, band_geojson_dir, band_cells, label=label,
-        native_gdal=native_gdal, runtime=runtime, max_workers=max_workers)
+        native_gdal=native_gdal, runtime=runtime, max_workers=max_workers,
+        data_dir=data_dir)
 
     # Stage 2b: clip legacy cells under reschemed cells of the same band
     # (see the Stage 2b section). Returns per-cell file overrides for
@@ -2680,7 +2749,7 @@ def process_source(
         export_to_geojson(
             enc_dir, geojson_dir, enc_files, label=label,
             native_gdal=native_gdal, runtime=runtime,
-            max_workers=max_workers)
+            max_workers=max_workers, data_dir=data_dir)
 
     # Stage 3: Consolidate
     consolidated = consolidate_geojson(geojson_dir, merged_dir,

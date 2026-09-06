@@ -29,6 +29,22 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its last layer, and a cell without one is re-exported. Found when a
   resumed local build shipped 39 cells with most layers missing (SOUNDG
   included) at z13-16.
+- Export freshness is now keyed on the cell's own version. Each cell's
+  completion marker holds its S-57 edition and update numbers
+  (`EDTN.UPDN`, e.g. `62.0`, read from DSID with updates applied); a cell
+  is re-exported only when those differ from the marker or its outputs
+  are gone. File times no longer decide anything: unzip, copy and
+  re-download all rewrite them, and a re-downloaded but unchanged zip
+  used to re-export every cell. The DSID cache (`data/enc/
+  .cell-editions.json`) is now keyed by cell name so the per-band copies
+  hit it.
+- GDAL export failures are reported. `ogr2ogr`/`ogrinfo` stderr used to
+  be discarded, so a layer that failed to export was a silent hole in
+  the chart. Failures are appended to `data/geojson/<band>/
+  .export-errors.log` (native and container paths) and the run prints
+  the count and the first few.
+- CI pins tippecanoe to 2.79.0 (`TIPPECANOE_VERSION` in
+  `build-charts.yml`) instead of building master on every run.
 - Gap-fill groups silently rendered nothing when a configured cell had
   been cancelled: `east_maine_offshore_band3` pointed at US3EC11M
   (cancelled), which blanked the Gulf of Maine at z15-16 (121k z16 tiles

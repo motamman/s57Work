@@ -55,7 +55,7 @@ For each band or source, the script runs these stages in order:
 6. tile-join  merge all band/source .mbtiles into the final file
 ```
 
-Every stage checks freshness by file modification time and skips work whose outputs are already newer than their inputs, so re-runs after a partial failure or an added input only redo what changed.
+Every stage checks freshness and skips work that is already up to date, so re-runs after a partial failure or an added input only redo what changed. The GDAL export keys on each cell's own edition and update numbers; the later stages key on file modification times.
 
 ### Skipped S-57 Layers
 
@@ -231,8 +231,8 @@ To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the 
 
 ### What gets skipped on a re-run
 
-- **Cancellation check**: one `ogrinfo` DSID read per cell, cached on the cell's file times; only new or updated cells are re-read.
-- **GDAL**: a cell is re-exported only if its `.000` or any update file is newer than its existing GeoJSON.
+- **Cancellation check and cell versions**: one `ogrinfo` DSID read per cell, cached in `data/enc/.cell-editions.json` by cell name and file time; only new or updated cells are re-read.
+- **GDAL**: a cell is re-exported only if its version (S-57 edition and update numbers, read from DSID with updates applied) differs from the one recorded in its completion marker `data/geojson/<band>/.<CELL>.exported`, or its GeoJSON is gone. An export interrupted mid-cell leaves no marker and is redone. Per-layer GDAL failures are listed in `data/geojson/<band>/.export-errors.log` and summarised on stderr.
 - **Same-band overlap resolution**: detection is cached on the cells' `M_COVR` exports and reruns only when one changes; a clipped legacy layer is redone only if its source file or the clip polygon is newer. Bands with no resolvable pair cost nothing.
 - **Consolidate**: a merged layer is rebuilt only if any of its per-cell inputs (or its clipped replacement) is newer, or the heavy-layer minzoom config changed.
 - **Erase**: the erase polygon is recomputed every run (cheap) but only rewritten when it changes; an erased layer is re-clipped only if its source layer or the erase polygon is newer.
