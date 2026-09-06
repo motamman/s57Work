@@ -190,6 +190,8 @@ In practice the freshness checks make this mode rarely necessary: re-running the
 | `--maxzoom` | Maximum zoom level | 16 |
 | `--geojson-dir` | Use existing GeoJSON, skip GDAL | — |
 | `-j, --jobs` | Parallel workers for GDAL export, consolidation, and bands | half the CPU count |
+| `--catalog XML` | By-band: use this NOAA ENC product catalog instead of downloading `ENCProdCat_19115.xml` into `data/` (refreshed daily) | download |
+| `--no-replacements` | By-band: do not fetch the reschemed cells that replace cancelled cells from NOAA's catalog | fetch |
 
 ---
 

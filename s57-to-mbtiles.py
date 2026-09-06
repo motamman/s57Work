@@ -50,6 +50,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
+import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -233,6 +235,12 @@ Skip GDAL (use existing GeoJSON):
     parser.add_argument("-j", "--jobs", type=int,
                         default=max(1, (os.cpu_count() or 2) // 2),
                         help="Parallel workers (default: half CPU count)")
+    parser.add_argument("--catalog", metavar="XML",
+                        help="NOAA ENC product catalog to use instead of "
+                             "downloading ENCProdCat_19115.xml (by-band)")
+    parser.add_argument("--no-replacements", action="store_true",
+                        help="Do not fetch the reschemed cells that replace "
+                             "cancelled ones from NOAA's catalog (by-band)")
     return parser
 
 
@@ -374,15 +382,29 @@ def _mbtiles_zoom_range(path: Path) -> Optional[Tuple[int, int]]:
         return None
 
 
+def _cell_marker(geojson_dir: Path, cell: str) -> Path:
+    """Completion marker written after the LAST layer of a cell is
+    exported. Without it an export interrupted mid-cell (killed run, lost
+    CI runner) leaves a partial layer set whose files are all newer than
+    the source, and cell_outputs_fresh would accept the cell as complete
+    forever (2026-09-05: 39 cells missing most layers, SOUNDG included,
+    after a killed run was resumed)."""
+    return geojson_dir / f".{cell}.exported"
+
+
 def cell_outputs_fresh(enc_path: Path, geojson_dir: Path,
                        multi_file: bool) -> bool:
-    """True if all GeoJSON outputs for this cell are newer than every source
-    file (.000 + any .001..NNN ER updates in the same directory)."""
+    """True if the cell's completion marker and all its GeoJSON outputs
+    are newer than every source file (.000 + any .001..NNN ER updates in
+    the same directory)."""
     cell_stem = enc_path.stem
     sources = list(enc_path.parent.glob(f"{cell_stem}.*"))
     if not sources:
         return False
     source_mtime = max(s.stat().st_mtime for s in sources)
+    marker = _cell_marker(geojson_dir, cell_stem)
+    if not marker.exists() or marker.stat().st_mtime < source_mtime:
+        return False
     if multi_file:
         outputs = list(geojson_dir.glob(f"*_{cell_stem}.geojson"))
     else:
@@ -557,6 +579,234 @@ def _remove_orphan_cells(geojson_dir: Path, wanted_cells: set):
         cell = cell_name_from_stem(f.stem)
         if cell and cell not in wanted_cells:
             f.unlink()
+    for m in geojson_dir.glob(".US*.exported"):
+        if m.name[1:-9].upper() not in wanted_cells:
+            m.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b: replacement cells from NOAA's product catalog
+# ---------------------------------------------------------------------------
+#
+# NOAA's district zips hold the cells NOAA files under that district. The
+# rescheming program replaces one legacy cell that spanned several
+# districts with gridded cells that are each filed under ONE district, so
+# a district zip can lose coverage of its own waters the day NOAA cancels
+# the legacy cell: 01CGD's band 2 chart west of 72°W (New York, Long
+# Island Sound, Connecticut) was US2EC04M, cancelled 2026-07-24; its
+# successor there, US2ATLPC, is filed under district 5 and ships only in
+# 05CGD_ENCs.zip. Dropping cancelled cells (correct: S-57 says a
+# cancelled cell must not be displayed) therefore emptied z9-10 over New
+# York in the 2026-09-05 build.
+#
+# This stage restores coverage with CURRENT data rather than the withdrawn
+# chart: for every cancelled cell it looks up, in NOAA's ENC product
+# catalog (per-cell extent polygons, "coast guard district" keyword and a
+# per-cell download link), the live reschemed cells of the same band whose
+# extent overlaps the cancelled cell AND overlaps the district's own
+# charted waters (the extents of the input's live band >= 3 cells — the
+# same notion of "district region" trim_low_bands_to_region uses), and
+# downloads the ones missing from the input. They then go through the
+# normal pipeline (band grouping, Stage 2b, erase) like any other cell.
+# Legacy-named cells (USbXXnnM) are never fetched: a neighbour district's
+# legacy cell is exactly the same-band overlap Stage 2b exists to avoid.
+# Extents are catalog polygons' bounding boxes (reschemed cells are grid
+# rectangles, so exact for what is fetched) and the cancelled cell's
+# M_COVR extent from ogrinfo.
+
+CATALOG_URL = "https://charts.noaa.gov/ENCs/ENCProdCat_19115.xml"
+CELL_ZIP_URL = "https://charts.noaa.gov/ENCs/{cell}.zip"
+CATALOG_MAX_AGE_S = 24 * 3600
+LEGACY_CELL_RE = re.compile(r"^US\d[A-Z]{2}\d{2}M$", re.IGNORECASE)
+
+BBox = Tuple[float, float, float, float]  # w, s, e, n
+
+
+@dataclass
+class CatalogCell:
+    name: str
+    band: int
+    district: str
+    bbox: BBox
+    url: str
+
+
+def _bbox_intersects(a: BBox, b: BBox) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _download(url: str, dest: Path, attempts: int = 3) -> bool:
+    """curl when available (it uses the system trust store; Python builds
+    without certificates fail TLS to charts.noaa.gov), else urllib."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    curl = shutil.which("curl")
+    for i in range(attempts):
+        try:
+            if curl:
+                subprocess.run([curl, "-fsSL", "--retry", "3", "--retry-delay", "5",
+                                "-o", str(tmp), url], check=True,
+                               capture_output=True, text=True)
+            else:
+                with urllib.request.urlopen(url, timeout=120) as r, \
+                        open(tmp, "wb") as f:
+                    shutil.copyfileobj(r, f)
+            tmp.replace(dest)
+            return True
+        except Exception as e:  # noqa: BLE001 - any network error retries
+            detail = getattr(e, "stderr", None) or str(e)
+            print(f"  download failed ({i + 1}/{attempts}) {url}: "
+                  f"{str(detail).strip()[:200]}", file=sys.stderr)
+            time.sleep(5 * (i + 1))
+    tmp.unlink(missing_ok=True)
+    return False
+
+
+def fetch_catalog(data_dir: Path, override: Optional[Path]) -> Optional[Path]:
+    """NOAA's ENC product catalog, cached in data_dir for CATALOG_MAX_AGE_S.
+    A stale cached copy is still used when the download fails."""
+    if override:
+        return override
+    dest = data_dir / "ENCProdCat_19115.xml"
+    fresh = dest.exists() and time.time() - dest.stat().st_mtime < CATALOG_MAX_AGE_S
+    if fresh:
+        return dest
+    print("Downloading NOAA ENC product catalog...")
+    if _download(CATALOG_URL, dest):
+        return dest
+    if dest.exists():
+        print("WARNING: using stale cached catalog", file=sys.stderr)
+        return dest
+    return None
+
+
+def parse_catalog(path: Path) -> Dict[str, CatalogCell]:
+    """Live cells with an extent polygon. Cancelled cells stay listed in
+    the catalog but carry no polygon, so they drop out here."""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    cells: Dict[str, CatalogCell] = {}
+    for m in re.finditer(r"<title>\s*<gco:CharacterString>(US\d[A-Z0-9]{5})"
+                         r"</gco:CharacterString>", text):
+        name = m.group(1).upper()
+        end = text.find("</MD_DataIdentification>", m.start())
+        blk = text[m.start():end if end > 0 else m.start() + 20000]
+        pts = [tuple(map(float, p.split()))
+               for p in re.findall(r"<gml:pos>([^<]*)</gml:pos>", blk)]
+        if not pts:
+            continue
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        d = re.search(r"coast guard district: (\d+)", blk)
+        cells[name] = CatalogCell(
+            name, int(name[2]), d.group(1) if d else "?",
+            (min(lons), min(lats), max(lons), max(lats)),
+            CELL_ZIP_URL.format(cell=name))
+    return cells
+
+
+def read_cell_extent(enc: Path, gdal: "GdalRunner") -> Optional[BBox]:
+    """Extent of the cell's M_COVR layer (all coverage records)."""
+    res = subprocess.run(gdal.cmd(["ogrinfo", "-ro", "-so", enc, "M_COVR"]),
+                         capture_output=True, text=True)
+    m = re.search(r"Extent: \(([-\d.]+), ([-\d.]+)\) - \(([-\d.]+), ([-\d.]+)\)",
+                  res.stdout)
+    return tuple(float(v) for v in m.groups()) if m else None  # type: ignore
+
+
+def is_reschemed_name(name: str) -> bool:
+    band = enc_band(Path(name))
+    if band in RESCHEMED_REGION_CODES:
+        return classify_cell(name) == "reschemed"
+    return not LEGACY_CELL_RE.match(name)
+
+
+def fetch_replacement_cells(cancelled: List[dict], live: List[Path],
+                            data_dir: Path, gdal: "GdalRunner",
+                            catalog_path: Optional[Path],
+                            record_path: Path) -> List[Path]:
+    """Download the live reschemed cells that replace `cancelled` inside
+    this district's waters and are missing from `live`; return their .000
+    paths. Writes record_path describing what was fetched and why."""
+    record = {"rule": "catalog same-band reschemed cells overlapping a "
+                      "cancelled cell and the input's band>=3 extents",
+              "fetched": []}
+    if not cancelled:
+        record_path.write_text(json.dumps(record, indent=1))
+        return []
+    catalog_file = fetch_catalog(data_dir, catalog_path)
+    if not catalog_file:
+        print("WARNING: no NOAA catalog available; cancelled cells are not "
+              "replaced", file=sys.stderr)
+        return []
+    catalog = parse_catalog(catalog_file)
+    have = {e.stem.upper() for e in live}
+    region = [catalog[n].bbox for n in have if n in catalog and catalog[n].band >= 3]
+    if not region:
+        print("WARNING: no band>=3 cell of the input is in the catalog; "
+              "cannot define the district region, cancelled cells are not "
+              "replaced", file=sys.stderr)
+        return []
+
+    wanted: Dict[str, dict] = {}
+    # cancelled cell -> live same-band cells overlapping it (in the input
+    # or fetched below). Gap-fill groups use this to follow a cancelled
+    # cell to its successors (_prepare_gap_fill_group).
+    successors: Dict[str, List[str]] = {}
+    for c in cancelled:
+        extent = read_cell_extent(Path(c["path"]), gdal)
+        if not extent:
+            continue
+        for cat in catalog.values():
+            if (cat.band != c["band"] or cat.name in have
+                    or not is_reschemed_name(cat.name)
+                    or not _bbox_intersects(cat.bbox, extent)
+                    or not any(_bbox_intersects(cat.bbox, r) for r in region)):
+                continue
+            w = wanted.setdefault(cat.name, {
+                "cell": cat.name, "band": cat.band, "district": cat.district,
+                "url": cat.url, "replaces": []})
+            w["replaces"].append(c["cell"])
+        successors[c["cell"]] = sorted(
+            n for n in have if n in catalog and catalog[n].band == c["band"]
+            and is_reschemed_name(n) and _bbox_intersects(catalog[n].bbox, extent))
+    record["successors"] = successors
+
+    fetched: List[Path] = []
+    zips_dir = data_dir / "zips"
+    enc_root = data_dir / "enc" / "replacements"
+    for name in sorted(wanted):
+        w = wanted[name]
+        zip_path = zips_dir / f"{name}.zip"
+        stale = (not zip_path.exists()
+                 or time.time() - zip_path.stat().st_mtime > CATALOG_MAX_AGE_S)
+        if stale and not _download(w["url"], zip_path):
+            print(f"WARNING: could not download replacement cell {name}",
+                  file=sys.stderr)
+            continue
+        dest = enc_root / name
+        if dest.exists():
+            shutil.rmtree(dest)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(dest)
+        base = next(iter(sorted(dest.rglob(f"{name}.000"))), None)
+        if base is None:
+            print(f"WARNING: {zip_path.name} holds no {name}.000", file=sys.stderr)
+            continue
+        fetched.append(base)
+        w["path"] = str(base)
+        record["fetched"].append(w)
+        for c in w["replaces"]:
+            successors[c].append(name)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record, indent=1))
+    if fetched:
+        print(f"Fetched {len(fetched)} replacement cell(s) from NOAA's catalog "
+              f"for cancelled cells: "
+              + " ".join(f"{w['cell']}(d{w['district']}<-{'+'.join(w['replaces'])})"
+                         for w in record["fetched"]))
+    else:
+        print("No replacement cells needed from NOAA's catalog")
+    return fetched
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +886,7 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
         pattern = f"*_{name}.geojson" if multi_file else "*.geojson"
         for old in geojson_dir.glob(pattern):
             old.unlink()
+        _cell_marker(geojson_dir, name).unlink(missing_ok=True)
 
         for layer in layers:
             if layer in SKIP_LAYERS:
@@ -648,6 +899,7 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
                             "-oo", "ADD_SOUNDG_DEPTH=YES"])
             cmd.extend([str(outpath), str(enc), layer])
             subprocess.run(cmd, capture_output=True)
+        _cell_marker(geojson_dir, name).touch()
 
         done[0] += 1
         print(f"{tag}[{done[0]}/{total}] {name}")
@@ -691,7 +943,7 @@ for rel in $cells; do
   i=$((i + 1))
   name=$(basename "$enc" .000)
   echo "[$i/$count] $name"
-  rm -f {rm_pattern}
+  rm -f {rm_pattern} "/output/.$name.exported"
   layers=$(ogrinfo -so "$enc" 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{{print $2}}' | awk '{{print $1}}')
   for layer in $layers; do
     case "$layer" in {skip_case}) continue ;; esac
@@ -706,6 +958,7 @@ for rel in $cells; do
         "/output/$outname.geojson" "$enc" "$layer" 2>/dev/null || true
     fi
   done
+  touch "/output/.$name.exported"
 done
 echo "Export complete"
 """
@@ -1658,8 +1911,27 @@ def _prepare_gap_fill_group(
     # We just glob across all band* dirs to find each requested cell —
     # cells absent from this build's ENC input produce no matches and
     # are silently skipped.
-    cell_files: Dict[str, List[Path]] = {}
+    # A configured cell NOAA has since cancelled is followed to its live
+    # successors (recorded by fetch_replacement_cells): on 2026-09-05
+    # east_maine_offshore_band3 pointed at cancelled US3EC11M and silently
+    # rendered nothing, blanking the Gulf of Maine at z15-16.
+    successors: Dict[str, List[str]] = {}
+    try:
+        successors = json.loads(
+            (data_dir / "replacement-cells.json").read_text())["successors"]
+    except (OSError, ValueError, KeyError):
+        pass
+    wanted_cells: List[str] = []
     for cell_id in group.cells:
+        if cell_id in successors:
+            print(f"   [{group.name}] {cell_id} is cancelled; using "
+                  f"successors {' '.join(successors[cell_id]) or '(none)'}")
+            wanted_cells.extend(successors[cell_id])
+        else:
+            wanted_cells.append(cell_id)
+
+    cell_files: Dict[str, List[Path]] = {}
+    for cell_id in dict.fromkeys(wanted_cells):
         matches: List[Path] = []
         for band_dir in sorted(geojson_root.glob("band*")):
             # bandN only: bandN.resolved holds Stage 2b's clipped copies
@@ -2175,6 +2447,8 @@ def process_by_band(
     native_gdal: bool,
     runtime: Optional[str],
     max_workers: int,
+    replacements: bool = True,
+    catalog_path: Optional[Path] = None,
 ) -> List[Path]:
     print("\n-- By-band mode ---------------------------------------------------")
 
@@ -2194,6 +2468,15 @@ def process_by_band(
     gdal_probe = GdalRunner(native_gdal, runtime, data_dir)
     all_enc = drop_cancelled_cells(all_enc, data_dir, gdal_probe, max_workers,
                                    data_dir / "cancelled-cells.json")
+
+    # Stage 1b: cancelled cells whose reschemed successors NOAA files
+    # under another district leave holes; fetch those successors.
+    if replacements:
+        cancelled = json.loads(
+            (data_dir / "cancelled-cells.json").read_text())["cancelled"]
+        all_enc = all_enc + fetch_replacement_cells(
+            cancelled, all_enc, data_dir, gdal_probe, catalog_path,
+            data_dir / "replacement-cells.json")
 
     by_band = group_by_band(all_enc)
 
@@ -2448,7 +2731,9 @@ def main():
         # process_by_band returns one .mbtiles per band, ordered coarse → fine
         tile_files = process_by_band(
             input_paths, data_dir, args.minzoom, args.maxzoom,
-            native_gdal, runtime, args.jobs)
+            native_gdal, runtime, args.jobs,
+            replacements=not args.no_replacements,
+            catalog_path=Path(args.catalog).resolve() if args.catalog else None)
 
         if len(tile_files) == 1:
             shutil.copy2(tile_files[0], tiles_path)

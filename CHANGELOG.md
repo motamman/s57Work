@@ -8,6 +8,34 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Dropping cancelled cells emptied z9-10 over New York Harbor, Long
+  Island Sound and the Connecticut coast in the 2026-09-05 01CGD build.
+  NOAA cancelled US2EC04M (2026-07-24) and files its reschemed successor
+  west of 72°W, US2ATLPC, under district 5, so it is not in
+  01CGD_ENCs.zip; the live legacy US2EC03M declares no data there. New
+  Stage 1b (`fetch_replacement_cells`) reads NOAA's ENC product catalog
+  and, for every cancelled cell, downloads the live reschemed same-band
+  cells that overlap both it and the input's band >= 3 extents, then runs
+  them through the normal pipeline. Verified by decoding tiles: New York
+  Harbor z9 went from 29 features and 1 DEPARE (published) to 218 and 7
+  (Sept 3 build: 228 and 8); Long Island Sound z9 from a 190-byte
+  CATCOV=2-only tile to 111 features and 3 DEPARE. `--catalog XML` uses a
+  local catalog, `--no-replacements` disables the stage; fetched cells are
+  listed in `data/replacement-cells.json`.
+- A GDAL export interrupted mid-cell (killed run, lost runner) left a
+  partial layer set that the resume logic accepted as complete, because
+  `cell_outputs_fresh` compared file times only. Each cell now gets a
+  completion marker (`data/geojson/<band>/.<CELL>.exported`) written after
+  its last layer, and a cell without one is re-exported. Found when a
+  resumed local build shipped 39 cells with most layers missing (SOUNDG
+  included) at z13-16.
+- Gap-fill groups silently rendered nothing when a configured cell had
+  been cancelled: `east_maine_offshore_band3` pointed at US3EC11M
+  (cancelled), which blanked the Gulf of Maine at z15-16 (121k z16 tiles
+  present in the Sept 3 build, none in the Sept 5 one). A cancelled cell
+  in a group now resolves to its live same-band successors, recorded by
+  Stage 1b in `replacement-cells.json` under `successors`, and the
+  substitution is printed.
 - By-band mode shipped two charts in the same tiles at every zoom from 9
   to 16. The zoom extension and gap fills both relied on tile-join letting
   a later input win where tilesets overlap; tile-join instead merges
