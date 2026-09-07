@@ -1,0 +1,443 @@
+{
+ "rule": "catalog same-band reschemed cells overlapping a cancelled cell and the input's band>=3 extents",
+ "fetched": [
+  {
+   "cell": "US4NJ1CD",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1CD.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1CD/ENC_ROOT/US4NJ1CD/US4NJ1CD.000"
+  },
+  {
+   "cell": "US4NJ1CE",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1CE.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1CE/ENC_ROOT/US4NJ1CE/US4NJ1CE.000"
+  },
+  {
+   "cell": "US4NJ1CF",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1CF.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1CF/ENC_ROOT/US4NJ1CF/US4NJ1CF.000"
+  },
+  {
+   "cell": "US4NJ1CG",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1CG.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1CG/ENC_ROOT/US4NJ1CG/US4NJ1CG.000"
+  },
+  {
+   "cell": "US4NJ1DE",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1DE.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1DE/ENC_ROOT/US4NJ1DE/US4NJ1DE.000"
+  },
+  {
+   "cell": "US4NJ1DF",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1DF.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1DF/ENC_ROOT/US4NJ1DF/US4NJ1DF.000"
+  },
+  {
+   "cell": "US4NJ1DG",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1DG.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1DG/ENC_ROOT/US4NJ1DG/US4NJ1DG.000"
+  },
+  {
+   "cell": "US4NJ1EE",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1EE.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1EE/ENC_ROOT/US4NJ1EE/US4NJ1EE.000"
+  },
+  {
+   "cell": "US4NJ1EF",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1EF.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1EF/ENC_ROOT/US4NJ1EF/US4NJ1EF.000"
+  },
+  {
+   "cell": "US4NJ1EG",
+   "band": 4,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US4NJ1EG.zip",
+   "replaces": [
+    "US4NJ23M"
+   ],
+   "path": "data/enc/replacements/US4NJ1EG/ENC_ROOT/US4NJ1EG/US4NJ1EG.000"
+  },
+  {
+   "cell": "US5NJ1JI",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1JI.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1JI/ENC_ROOT/US5NJ1JI/US5NJ1JI.000"
+  },
+  {
+   "cell": "US5NJ1JJ",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1JJ.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1JJ/ENC_ROOT/US5NJ1JJ/US5NJ1JJ.000"
+  },
+  {
+   "cell": "US5NJ1JK",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1JK.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1JK/ENC_ROOT/US5NJ1JK/US5NJ1JK.000"
+  },
+  {
+   "cell": "US5NJ1KJ",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1KJ.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1KJ/ENC_ROOT/US5NJ1KJ/US5NJ1KJ.000"
+  },
+  {
+   "cell": "US5NJ1KK",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1KK.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1KK/ENC_ROOT/US5NJ1KK/US5NJ1KK.000"
+  },
+  {
+   "cell": "US5NJ1KL",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1KL.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1KL/ENC_ROOT/US5NJ1KL/US5NJ1KL.000"
+  },
+  {
+   "cell": "US5NJ1LK",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1LK.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1LK/ENC_ROOT/US5NJ1LK/US5NJ1LK.000"
+  },
+  {
+   "cell": "US5NJ1LL",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1LL.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1LL/ENC_ROOT/US5NJ1LL/US5NJ1LL.000"
+  },
+  {
+   "cell": "US5NJ1LM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1LM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1LM/ENC_ROOT/US5NJ1LM/US5NJ1LM.000"
+  },
+  {
+   "cell": "US5NJ1MK",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1MK.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1MK/ENC_ROOT/US5NJ1MK/US5NJ1MK.000"
+  },
+  {
+   "cell": "US5NJ1ML",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1ML.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1ML/ENC_ROOT/US5NJ1ML/US5NJ1ML.000"
+  },
+  {
+   "cell": "US5NJ1MM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1MM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1MM/ENC_ROOT/US5NJ1MM/US5NJ1MM.000"
+  },
+  {
+   "cell": "US5NJ1NK",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1NK.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1NK/ENC_ROOT/US5NJ1NK/US5NJ1NK.000"
+  },
+  {
+   "cell": "US5NJ1NL",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1NL.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1NL/ENC_ROOT/US5NJ1NL/US5NJ1NL.000"
+  },
+  {
+   "cell": "US5NJ1NM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1NM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1NM/ENC_ROOT/US5NJ1NM/US5NJ1NM.000"
+  },
+  {
+   "cell": "US5NJ1OK",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1OK.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1OK/ENC_ROOT/US5NJ1OK/US5NJ1OK.000"
+  },
+  {
+   "cell": "US5NJ1OL",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1OL.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1OL/ENC_ROOT/US5NJ1OL/US5NJ1OL.000"
+  },
+  {
+   "cell": "US5NJ1OM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1OM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1OM/ENC_ROOT/US5NJ1OM/US5NJ1OM.000"
+  },
+  {
+   "cell": "US5NJ1PL",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1PL.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1PL/ENC_ROOT/US5NJ1PL/US5NJ1PL.000"
+  },
+  {
+   "cell": "US5NJ1PM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1PM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1PM/ENC_ROOT/US5NJ1PM/US5NJ1PM.000"
+  },
+  {
+   "cell": "US5NJ1QL",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1QL.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1QL/ENC_ROOT/US5NJ1QL/US5NJ1QL.000"
+  },
+  {
+   "cell": "US5NJ1QM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1QM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1QM/ENC_ROOT/US5NJ1QM/US5NJ1QM.000"
+  },
+  {
+   "cell": "US5NJ1QN",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1QN.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1QN/ENC_ROOT/US5NJ1QN/US5NJ1QN.000"
+  },
+  {
+   "cell": "US5NJ1RM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1RM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1RM/ENC_ROOT/US5NJ1RM/US5NJ1RM.000"
+  },
+  {
+   "cell": "US5NJ1RN",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1RN.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1RN/ENC_ROOT/US5NJ1RN/US5NJ1RN.000"
+  },
+  {
+   "cell": "US5NJ1SM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1SM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1SM/ENC_ROOT/US5NJ1SM/US5NJ1SM.000"
+  },
+  {
+   "cell": "US5NJ1SN",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1SN.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1SN/ENC_ROOT/US5NJ1SN/US5NJ1SN.000"
+  },
+  {
+   "cell": "US5NJ1TM",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1TM.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1TM/ENC_ROOT/US5NJ1TM/US5NJ1TM.000"
+  },
+  {
+   "cell": "US5NJ1TN",
+   "band": 5,
+   "district": "5",
+   "url": "https://charts.noaa.gov/ENCs/US5NJ1TN.zip",
+   "replaces": [
+    "US5NJ30M"
+   ],
+   "path": "data/enc/replacements/US5NJ1TN/ENC_ROOT/US5NJ1TN/US5NJ1TN.000"
+  }
+ ],
+ "successors": {
+  "US4NJ23M": [
+   "US4NJ1CD",
+   "US4NJ1CE",
+   "US4NJ1CF",
+   "US4NJ1CG",
+   "US4NJ1DE",
+   "US4NJ1DF",
+   "US4NJ1DG",
+   "US4NJ1EE",
+   "US4NJ1EF",
+   "US4NJ1EG"
+  ],
+  "US5NJ30M": [
+   "US5NJ1UM",
+   "US5NJ1UN",
+   "US5NJ1UO",
+   "US5NJ1JI",
+   "US5NJ1JJ",
+   "US5NJ1JK",
+   "US5NJ1KJ",
+   "US5NJ1KK",
+   "US5NJ1KL",
+   "US5NJ1LK",
+   "US5NJ1LL",
+   "US5NJ1LM",
+   "US5NJ1MK",
+   "US5NJ1ML",
+   "US5NJ1MM",
+   "US5NJ1NK",
+   "US5NJ1NL",
+   "US5NJ1NM",
+   "US5NJ1OK",
+   "US5NJ1OL",
+   "US5NJ1OM",
+   "US5NJ1PL",
+   "US5NJ1PM",
+   "US5NJ1QL",
+   "US5NJ1QM",
+   "US5NJ1QN",
+   "US5NJ1RM",
+   "US5NJ1RN",
+   "US5NJ1SM",
+   "US5NJ1SN",
+   "US5NJ1TM",
+   "US5NJ1TN"
+  ]
+ }
+}

@@ -53,6 +53,7 @@ import sys
 import time
 import urllib.request
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,27 +81,106 @@ BAND_ZOOM: Dict[int, Tuple[int, int, str, str]] = {
 # in process_by_band for the rationale and cost history.
 BAND_ZOOM_EXTENSION = 2
 
-# Per-layer minzoom offset (in zoom levels) from a band's NATIVE minzoom.
-# Layers not listed default to 0 (emit from band's bottom zoom).
-# Heavy/dense layers get +1 so they only appear at the top of the band.
+# Zoom presence of point layers inside a source's zoom range.
 #
-# Enforcement: tippecanoe silently IGNORES a per-layer "minzoom" in the
-# -L JSON layer spec (verified against v2.78.0), so these offsets are
-# applied by stamping the feature-level `tippecanoe.minzoom` extension
-# onto each feature during consolidation (merge_geojson_layer), which
-# tippecanoe does honor. Applies in by-band mode and gap fills; plain
-# single-source mode has no band context and emits all layers from its
-# bottom zoom.
-LAYER_MIN_ZOOM_OFFSET: Dict[str, int] = {
-    # Aids to navigation — only meaningful at approach detail or finer
-    "LIGHTS": 1,
-    "BCNLAT": 1, "BCNCAR": 1, "BCNISD": 1, "BCNSPP": 1,
-    "BOYLAT": 1, "BOYCAR": 1, "BOYISD": 1, "BOYSAW": 1, "BOYSPP": 1,
-    # Hazards — same logic
-    "OBSTRN": 1, "WRECKS": 1, "UWTROC": 1,
-    # Soundings — extremely dense; push to top of band
-    "SOUNDG": 1,
-}
+# Every layer renders from the bottom zoom of its source (a band, or a
+# gap fill). Until 2026-09-07 the aids-to-navigation, hazard and SOUNDG
+# layers were held back one zoom from a band's native bottom (a +1
+# offset added in 0.6.0 as a density control), and tippecanoe's default
+# point drop rate (2.5 per zoom below a run's top zoom) thinned every
+# point layer at the bottom zoom of every run. Once the finer-wins erase
+# (Stage 3b) removed the coarser band under finer coverage, the odd
+# zooms had nothing left: band 3's extension is erased under band 4 at
+# z13 while band 4's own soundings began at z14, so the published
+# district files carried SOUNDG only at even zooms, and lights, buoys,
+# beacons, wrecks, obstructions and rocks vanished at z11/13/15 the same
+# way. Nobody re-measured the odd zooms after the erase landed.
+#
+# Now: in by-band mode tippecanoe never drops points (--drop-rate=1);
+# zoom presence is decided here, per feature, through the
+# `tippecanoe.minzoom` extension stamped during consolidation and
+# re-applied after the erase (tippecanoe silently ignores a per-layer
+# minzoom in the -L spec, verified v2.78.0). Only SOUNDG is dense enough
+# to need gating (ZoomRule, soundg_rule):
+#   * bands 1-2 (overview, general): soundings only at the band's top
+#     zoom, z8 and z10, unchanged;
+#   * band 3 and finer, and gap fills: soundings from the source's
+#     bottom zoom, never below SOUNDG_MIN_ZOOM, and at that bottom zoom
+#     only one in SOUNDG_THIN_RATE of them (the rate tippecanoe applied
+#     until now), so a z13 tile carries about 1.6x the soundings of a
+#     z14 tile (four z14 tiles' worth, thinned 2.5x) rather than four
+#     times as many. Which soundings survive at the thinned zoom is a
+#     hash of the sounding's identity (LNAM and position), so the pick
+#     is identical in the pristine and the erased copy of a layer and
+#     stable from run to run.
+# Plain single-source mode has no band context: no stamps, and
+# tippecanoe's default drop rate remains the only thinning there.
+SOUNDG_MIN_ZOOM = BAND_ZOOM[2][1]   # z10: never below the general band's top
+SOUNDG_THIN_RATE = 2.5
+SOUNDG_OVERVIEW_BANDS = (1, 2)
+
+
+@dataclass(frozen=True)
+class ZoomRule:
+    """Per-feature minzoom for one layer of one source. Features get
+    `minzoom`; with thin_rate set, only one in thin_rate of them does and
+    the rest get minzoom + 1."""
+    minzoom: int
+    thin_rate: Optional[float] = None
+
+    def as_json(self) -> list:
+        """[minzoom, thin_rate]: the form stored in the merged-dir
+        source marker so a rule change invalidates the merged layer."""
+        return [self.minzoom, self.thin_rate]
+
+
+def soundg_rule(band: Optional[int], bottom_zoom: int) -> ZoomRule:
+    """SOUNDG rule for a source whose data is of usage band `band` (None
+    when unknown) rendering from bottom_zoom (a band's NATIVE bottom, a
+    gap fill's configured bottom — config-static, so cached merges stay
+    valid across CLI zoom arguments)."""
+    if band in SOUNDG_OVERVIEW_BANDS:
+        return ZoomRule(BAND_ZOOM[band][1])
+    return ZoomRule(max(bottom_zoom, SOUNDG_MIN_ZOOM), SOUNDG_THIN_RATE)
+
+
+def layer_zoom_rules(band: Optional[int],
+                     bottom_zoom: int) -> Dict[str, ZoomRule]:
+    """Layer name -> ZoomRule for a by-band source. Layers not listed
+    render from the source's bottom zoom untouched."""
+    return {"SOUNDG": soundg_rule(band, bottom_zoom)}
+
+
+def feature_minzoom(feat: dict, rule: ZoomRule) -> int:
+    """The minzoom rule assigns this feature. A thinned rule keeps one in
+    thin_rate features at rule.minzoom by hashing the feature's identity
+    — its S-57 LNAM plus its 2-D position, since soundings split from one
+    MultiPoint share the LNAM — and puts the others one zoom up."""
+    if rule.thin_rate is None:
+        return rule.minzoom
+    props = feat.get("properties") or {}
+    geom = feat.get("geometry") or {}
+    coords = geom.get("coordinates")
+    # First vertex, 2-D, rounded so the GDAL round trip of the erase
+    # (which re-serialises coordinates) hashes the same.
+    while isinstance(coords, list) and coords and isinstance(coords[0], list):
+        coords = coords[0]
+    pos = ""
+    if isinstance(coords, list) and len(coords) >= 2:
+        pos = f"{round(coords[0], 6)},{round(coords[1], 6)}"
+    key = f"{props.get('LNAM', '')}|{pos}"
+    bucket = zlib.crc32(key.encode("utf-8")) % 10000
+    return rule.minzoom if bucket * rule.thin_rate < 10000 else rule.minzoom + 1
+
+
+def stamp_feature(feat: dict, rule: Optional[ZoomRule]) -> None:
+    """Apply rule to feat in place as the tippecanoe.minzoom extension."""
+    if rule is None or not isinstance(feat, dict):
+        return
+    ext = feat.get("tippecanoe")
+    ext = dict(ext) if isinstance(ext, dict) else {}
+    ext["minzoom"] = feature_minzoom(feat, rule)
+    feat["tippecanoe"] = ext
 
 # Gap-fill config lives in enc-sources.yaml under the `gap_fills:` key.
 # See the comment block in that file for full background on what gap-fill
@@ -382,36 +462,53 @@ def _mbtiles_zoom_range(path: Path) -> Optional[Tuple[int, int]]:
         return None
 
 
+# tippecanoe's default --drop-rate; what a run without an explicit rate
+# was built with (recorded in the mbtiles metadata, see _patch_metadata).
+TIPPECANOE_DEFAULT_DROP_RATE = 2.5
+
+
+def _mbtiles_drop_rate(path: Path) -> Optional[float]:
+    """The drop rate an mbtiles was rendered with, from the `drop_rate`
+    metadata key _patch_metadata writes; None if absent or unreadable, so
+    a file built before the key existed (or by a different tippecanoe
+    invocation) is never reused as fresh."""
+    try:
+        db = sqlite3.connect(path)
+        row = db.execute("SELECT value FROM metadata "
+                         "WHERE name = 'drop_rate'").fetchone()
+        db.close()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
 def _cell_marker(geojson_dir: Path, cell: str) -> Path:
     """Completion marker written after the LAST layer of a cell is
-    exported. Without it an export interrupted mid-cell (killed run, lost
-    CI runner) leaves a partial layer set whose files are all newer than
-    the source, and cell_outputs_fresh would accept the cell as complete
-    forever (2026-09-05: 39 cells missing most layers, SOUNDG included,
-    after a killed run was resumed)."""
+    exported, holding the cell version (cell_version) the export was made
+    from. Two things it guarantees: an export interrupted mid-cell (killed
+    run, lost CI runner) has no marker and is redone (2026-09-05: 39 cells
+    missing most layers, SOUNDG included, after a killed run was resumed);
+    and freshness is decided by the cell's own edition/update numbers, not
+    by file times, which unzip, copy and re-download all rewrite."""
     return geojson_dir / f".{cell}.exported"
 
 
 def cell_outputs_fresh(enc_path: Path, geojson_dir: Path,
-                       multi_file: bool) -> bool:
-    """True if the cell's completion marker and all its GeoJSON outputs
-    are newer than every source file (.000 + any .001..NNN ER updates in
-    the same directory)."""
+                       multi_file: bool, version: str) -> bool:
+    """True if the cell was exported from exactly this version (marker
+    content == version) and its outputs are still there."""
     cell_stem = enc_path.stem
-    sources = list(enc_path.parent.glob(f"{cell_stem}.*"))
-    if not sources:
-        return False
-    source_mtime = max(s.stat().st_mtime for s in sources)
     marker = _cell_marker(geojson_dir, cell_stem)
-    if not marker.exists() or marker.stat().st_mtime < source_mtime:
+    try:
+        if version == "unknown" or marker.read_text().strip() != version:
+            return False
+    except OSError:
         return False
-    if multi_file:
-        outputs = list(geojson_dir.glob(f"*_{cell_stem}.geojson"))
-    else:
-        outputs = list(geojson_dir.glob("*.geojson"))
-    if not outputs:
-        return False
-    return all(o.stat().st_mtime >= source_mtime for o in outputs)
+    pattern = f"*_{cell_stem}.geojson" if multi_file else "*.geojson"
+    return any(True for _ in geojson_dir.glob(pattern))
+
+
+EXPORT_ERROR_LOG = ".export-errors.log"
 
 
 # ---------------------------------------------------------------------------
@@ -518,13 +615,14 @@ def read_cell_dsid(enc: Path, gdal: "GdalRunner") -> Dict[str, Optional[str]]:
     return out
 
 
-def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
-                         gdal: "GdalRunner", max_workers: int,
-                         record_path: Path) -> List[Path]:
-    """Return enc_files without cancelled cells (DSID EDTN = 0 after
-    updates). Results are cached in data/enc/.cell-editions.json keyed on
-    the newest mtime among the cell's files, so only new or updated cells
-    cost an ogrinfo call. Writes record_path listing the cancelled cells."""
+def read_cell_versions(enc_files: List[Path], data_dir: Path,
+                       gdal: "GdalRunner", max_workers: int,
+                       why: str = "") -> Dict[Path, Dict[str, Optional[str]]]:
+    """DSID EDTN/UPDN/ISDT of every cell, with updates applied. Cached in
+    data/enc/.cell-editions.json keyed by cell name and the newest mtime
+    among the cell's files (shutil.copy2 preserves mtimes, so the band
+    copies prepare_band makes hit the staging entries), so only new or
+    updated cells cost an ogrinfo call."""
     cache_path = data_dir / "enc" / ".cell-editions.json"
     try:
         cache = json.loads(cache_path.read_text())
@@ -534,25 +632,49 @@ def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
     def stamp(enc: Path) -> int:
         return max(f.stat().st_mtime_ns for f in _cell_files(enc) + [enc])
 
+    def key(enc: Path) -> str:
+        """Cache key: the cell name, shared by every staged copy."""
+        return enc.stem.upper()
+
     todo = [e for e in enc_files
-            if cache.get(str(e), {}).get("stamp") != stamp(e)]
+            if cache.get(key(e), {}).get("stamp") != stamp(e)]
     if todo:
-        print(f"Reading DSID of {len(todo)}/{len(enc_files)} cell(s) for "
-              "cancellation status...")
+        print(f"Reading DSID of {len(todo)}/{len(enc_files)} cell(s)"
+              f"{' for ' + why if why else ''}...")
 
         def one(e: Path):
-            return str(e), dict(read_cell_dsid(e, gdal), stamp=stamp(e))
+            """(cache key, DSID fields + stamp) for one cell."""
+            return key(e), dict(read_cell_dsid(e, gdal), stamp=stamp(e))
 
         with ThreadPoolExecutor(max_workers=max(1, max_workers) * 2) as pool:
-            for key, val in pool.map(one, todo):
-                cache[key] = val
+            for k, val in pool.map(one, todo):
+                cache[k] = val
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, indent=0, sort_keys=True))
+    return {e: cache.get(key(e), {}) for e in enc_files}
 
+
+def cell_version(info: Dict[str, Optional[str]]) -> str:
+    """The cell's published state, 'EDTN.UPDN' (e.g. '62.0'): the S-57
+    edition and update numbers after ER updates are applied. It changes
+    whenever NOAA changes the cell, and only then — the export freshness
+    key. 'unknown' when the DSID could not be read."""
+    if not info.get("EDTN"):
+        return "unknown"
+    return f"{info['EDTN']}.{info.get('UPDN') or 0}"
+
+
+def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
+                         gdal: "GdalRunner", max_workers: int,
+                         record_path: Path) -> List[Path]:
+    """Return enc_files without cancelled cells (DSID EDTN = 0 after
+    updates). Writes record_path listing the cancelled cells."""
+    versions = read_cell_versions(enc_files, data_dir, gdal, max_workers,
+                                  "cancellation status")
     kept: List[Path] = []
     cancelled = []
     for e in enc_files:
-        info = cache.get(str(e), {})
+        info = versions[e]
         if info.get("EDTN") == "0":
             cancelled.append({"cell": e.stem, "band": enc_band(e),
                               "cancel_update": info.get("UPDN"),
@@ -821,15 +943,26 @@ def export_to_geojson(
     native_gdal: bool = True,
     runtime: Optional[str] = None,
     max_workers: int = 1,
+    data_dir: Optional[Path] = None,
 ) -> List[Path]:
+    """Stage 2: export every layer of every cell in enc_files to GeoJSON
+    in geojson_dir, natively or in the GDAL container. Cells whose
+    completion marker holds their current EDTN.UPDN are skipped. Returns
+    the non-empty GeoJSON files present afterwards; per-layer failures
+    are logged to EXPORT_ERROR_LOG and summarised on stderr."""
     tag = f"[{label}] " if label else ""
     multi_file = len(enc_files) > 1
+    data_dir = data_dir or DATA_DIR
+    gdal = GdalRunner(native_gdal, runtime, data_dir)
 
-    # Per-cell freshness: only re-export cells whose source(s) are newer
-    # than their existing GeoJSON outputs.
+    # Per-cell freshness: re-export a cell only when its edition/update
+    # numbers differ from those its existing export was made from.
+    infos = read_cell_versions(enc_files, data_dir, gdal, max_workers,
+                               "export freshness")
+    versions = {f: cell_version(infos[f]) for f in enc_files}
     cells_to_process = [
         f for f in enc_files
-        if not cell_outputs_fresh(f, geojson_dir, multi_file)
+        if not cell_outputs_fresh(f, geojson_dir, multi_file, versions[f])
     ]
 
     if not cells_to_process:
@@ -841,12 +974,15 @@ def export_to_geojson(
     print(f"{tag}GDAL: converting {len(cells_to_process)}/{len(enc_files)} "
           f"cell(s) to GeoJSON...")
 
+    error_log = geojson_dir / EXPORT_ERROR_LOG
+    error_log.write_text("")
     if native_gdal:
         _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
-                       tag, max_workers)
+                       tag, max_workers, versions)
     else:
         _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
-                          multi_file, tag, label)
+                          multi_file, tag, label, versions)
+    _report_export_errors(tag, error_log)
 
     valid = []
     for f in list(geojson_dir.glob("*.geojson")):
@@ -859,16 +995,51 @@ def export_to_geojson(
     return valid
 
 
+def _report_export_errors(tag: str, error_log: Path):
+    """ogr2ogr/ogrinfo failures are per layer and used to vanish; a layer
+    that failed to export is a silent hole in the chart. Every failure is
+    appended to EXPORT_ERROR_LOG in the GeoJSON dir; this prints the count
+    and the first few."""
+    try:
+        lines = [ln for ln in error_log.read_text().splitlines() if ln.strip()]
+    except OSError:
+        return
+    if not lines:
+        return
+    print(f"{tag}WARNING: {len(lines)} GDAL export failure(s), see "
+          f"{error_log}", file=sys.stderr)
+    for ln in lines[:5]:
+        print(f"{tag}  {ln[:200]}", file=sys.stderr)
+
+
+def _log_export_error(error_log: Path, lock, text: str):
+    """Append one line to the export error log under the thread lock."""
+    with lock:
+        with open(error_log, "a") as fh:
+            fh.write(text.rstrip() + "\n")
+
+
 def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
-                   tag, max_workers):
+                   tag, max_workers, versions: Dict[Path, str]):
+    """Native ogr2ogr export of cells_to_process, max_workers cells at a
+    time. A cell's completion marker (holding versions[cell]) is written
+    only when every non-skipped layer exported."""
+    import threading
     total = len(cells_to_process)
     done = [0]
+    error_log = geojson_dir / EXPORT_ERROR_LOG
+    lock = threading.Lock()
 
     def process_enc(enc: Path):
+        """Export one cell: list its layers, drop its old outputs, run
+        ogr2ogr per layer, mark the cell complete if nothing failed."""
         name = enc.stem
         result = subprocess.run(
             ["ogrinfo", "-so", str(enc)], capture_output=True, text=True)
         if result.returncode != 0:
+            err = (result.stderr or "").strip().splitlines()
+            _log_export_error(error_log, lock,
+                              f"{name}: ogrinfo failed: {err[-1] if err else '?'}")
             return
 
         layers = []
@@ -888,6 +1059,7 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
             old.unlink()
         _cell_marker(geojson_dir, name).unlink(missing_ok=True)
 
+        failed = 0
         for layer in layers:
             if layer in SKIP_LAYERS:
                 continue
@@ -898,8 +1070,20 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
                 cmd.extend(["-oo", "SPLIT_MULTIPOINT=YES",
                             "-oo", "ADD_SOUNDG_DEPTH=YES"])
             cmd.extend([str(outpath), str(enc), layer])
-            subprocess.run(cmd, capture_output=True)
-        _cell_marker(geojson_dir, name).touch()
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0 or not outpath.exists():
+                failed += 1
+                err = (r.stderr or "").strip().splitlines()
+                _log_export_error(error_log, lock, f"{name} {layer}: "
+                                  f"{err[-1] if err else 'no output'}")
+        # The completion marker means "every layer of this version is
+        # here". A cell with a failed layer gets none, so the next run
+        # re-exports it instead of treating the hole as fresh.
+        if failed:
+            print(f"{tag}[{name}] {failed} layer(s) failed; cell left "
+                  "unmarked for retry", file=sys.stderr)
+        else:
+            _cell_marker(geojson_dir, name).write_text(versions[enc] + "\n")
 
         done[0] += 1
         print(f"{tag}[{done[0]}/{total}] {name}")
@@ -921,7 +1105,11 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
 
 
 def _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
-                      multi_file, tag, label):
+                      multi_file, tag, label, versions: Dict[Path, str]):
+    """Same export as _export_native, run as one shell script inside the
+    GDAL container with enc_dir and geojson_dir bind-mounted. The script
+    touches a marker per fully exported cell; the version is stamped in
+    afterwards."""
     skip_case = "|".join(SKIP_LAYERS)
     name_template = "${layer}_${name}" if multi_file else "${layer}"
     # Same orphan cleanup as _export_native (see comment there).
@@ -944,7 +1132,12 @@ for rel in $cells; do
   name=$(basename "$enc" .000)
   echo "[$i/$count] $name"
   rm -f {rm_pattern} "/output/.$name.exported"
-  layers=$(ogrinfo -so "$enc" 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{{print $2}}' | awk '{{print $1}}')
+  if ! ogrinfo -so "$enc" >/tmp/layers 2>/tmp/err; then
+    echo "$name: ogrinfo failed: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"
+    continue
+  fi
+  layers=$(grep -E '^[0-9]+:' /tmp/layers | awk -F': ' '{{print $2}}' | awk '{{print $1}}')
+  failed=0
   for layer in $layers; do
     case "$layer" in {skip_case}) continue ;; esac
     outname="{name_template}"
@@ -952,13 +1145,18 @@ for rel in $cells; do
     if [ "$layer" = "SOUNDG" ]; then
       ogr2ogr -f GeoJSON -oo SPLIT_MULTIPOINT=YES -oo ADD_SOUNDG_DEPTH=YES \
         -oo LIST_AS_STRING=YES \
-        "/output/$outname.geojson" "$enc" "$layer" 2>/dev/null || true
+        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || {{ echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"; failed=1; }}
     else
       ogr2ogr -f GeoJSON -oo LIST_AS_STRING=YES \
-        "/output/$outname.geojson" "$enc" "$layer" 2>/dev/null || true
+        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || {{ echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"; failed=1; }}
     fi
   done
-  touch "/output/.$name.exported"
+  # Marker only when every layer exported (see _export_native).
+  if [ "$failed" = 0 ]; then
+    touch "/output/.$name.exported"
+  else
+    echo "$name: layer failure(s); cell left unmarked for retry" >&2
+  fi
 done
 echo "Export complete"
 """
@@ -973,6 +1171,12 @@ echo "Export complete"
     if result.returncode != 0:
         print(f"ERROR: GDAL export failed ({label})", file=sys.stderr)
         sys.exit(1)
+    # The container touches a marker per cell whose every layer exported;
+    # stamp the version into every marker it left behind.
+    for enc in cells_to_process:
+        marker = _cell_marker(geojson_dir, enc.stem)
+        if marker.exists():
+            marker.write_text(versions[enc] + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -981,13 +1185,14 @@ echo "Export complete"
 
 def merge_geojson_layer(layer_name: str, source_files: List[Path],
                         output_path: Path,
-                        stamp_minzoom: Optional[int] = None):
+                        rule: Optional[ZoomRule] = None):
     """Merge multiple GeoJSON files into one valid FeatureCollection.
     Uses streaming writes to keep memory low.
 
-    When stamp_minzoom is set, each feature gets the tippecanoe feature
-    extension {"minzoom": N}, which tippecanoe honors natively — unlike
-    per-layer "minzoom" in the -L JSON spec, which it silently ignores."""
+    When rule is set, each feature gets the tippecanoe feature extension
+    {"minzoom": N} from feature_minzoom, which tippecanoe honors natively
+    — unlike per-layer "minzoom" in the -L JSON spec, which it silently
+    ignores."""
     with open(output_path, "w") as out:
         out.write('{"type":"FeatureCollection","features":[\n')
         first = True
@@ -998,11 +1203,7 @@ def merge_geojson_layer(layer_name: str, source_files: List[Path],
             except (json.JSONDecodeError, OSError):
                 continue
             for feat in fc.get("features", []):
-                if stamp_minzoom is not None and isinstance(feat, dict):
-                    ext = feat.get("tippecanoe")
-                    ext = dict(ext) if isinstance(ext, dict) else {}
-                    ext["minzoom"] = stamp_minzoom
-                    feat["tippecanoe"] = ext
+                stamp_feature(feat, rule)
                 if not first:
                     out.write(",\n")
                 json.dump(feat, out)
@@ -1011,7 +1212,7 @@ def merge_geojson_layer(layer_name: str, source_files: List[Path],
 
 
 def _stamp_marker_stale(merged_dir: Path,
-                        layer_minzoom: Optional[Dict[str, int]]) -> bool:
+                        layer_rules: Optional[Dict[str, ZoomRule]]) -> bool:
     """Freshness guard for per-feature minzoom stamps baked into merged
     GeoJSON: mtime checks can't see stamp-config changes, so the applied
     config is recorded in a marker file. Returns True (treat all merged
@@ -1019,7 +1220,8 @@ def _stamp_marker_stale(merged_dir: Path,
     updates the marker."""
     merged_dir.mkdir(parents=True, exist_ok=True)
     marker = merged_dir / ".layer-minzoom.json"
-    current = json.dumps(layer_minzoom or {}, sort_keys=True)
+    current = json.dumps({k: r.as_json() for k, r in
+                          (layer_rules or {}).items()}, sort_keys=True)
     try:
         if marker.exists() and marker.read_text() == current:
             return False
@@ -1043,6 +1245,8 @@ def _source_identity(src: Path, geojson_dir: Path) -> str:
 
 
 def _read_source_marker(merged_dir: Path) -> Dict[str, List[str]]:
+    """The merged dir's record of what each layer was built from
+    (see _write_source_marker); empty when missing or unreadable."""
     try:
         data = json.loads((merged_dir / SOURCE_MARKER).read_text())
         return data if isinstance(data, dict) else {}
@@ -1057,12 +1261,12 @@ def _write_source_marker(merged_dir: Path, sources: Dict[str, List[str]]):
 
 def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
                         max_workers: int = 1,
-                        layer_minzoom: Optional[Dict[str, int]] = None,
+                        layer_rules: Optional[Dict[str, ZoomRule]] = None,
                         overrides: Optional[Dict[str, Path]] = None
                         ) -> List[Path]:
     """Group geojson files by layer name and merge into one file per layer.
-    Returns list of merged file paths. layer_minzoom maps layer name →
-    absolute minzoom to stamp per-feature (see LAYER_MIN_ZOOM_OFFSET).
+    Returns list of merged file paths. layer_rules maps layer name → the
+    ZoomRule stamped per feature (see layer_zoom_rules).
     overrides maps a per-cell filename to a replacement file (Stage 2b's
     clipped copy of a legacy cell); a replacement with no features is
     skipped, so a fully erased cell contributes nothing."""
@@ -1092,7 +1296,7 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
     _remove_orphan_layers(merged_dir, set(layer_groups))
 
     # Per-layer freshness pre-pass (all stale if the stamp config changed)
-    force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
+    force_stale = _stamp_marker_stale(merged_dir, layer_rules)
     recorded = _read_source_marker(merged_dir)
     fresh: List[Path] = []
     stale: List[Tuple[str, List[Path], Path]] = []
@@ -1114,13 +1318,13 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
           f"(others fresh)...")
 
     def merge_one(item):
+        """Merge one layer's per-cell files into out_path with its rule."""
         layer_name, files, out_path = item
-        stamp = (layer_minzoom or {}).get(layer_name)
-        if len(files) == 1 and stamp is None:
+        rule = (layer_rules or {}).get(layer_name)
+        if len(files) == 1 and rule is None:
             shutil.copy2(files[0], out_path)
         else:
-            merge_geojson_layer(layer_name, files, out_path,
-                                stamp_minzoom=stamp)
+            merge_geojson_layer(layer_name, files, out_path, rule=rule)
         return out_path
 
     if max_workers <= 1:
@@ -1170,11 +1374,14 @@ def run_tippecanoe_for_source(
     minzoom: int,
     maxzoom: int,
     max_workers: int = 1,  # unused; tippecanoe handles its own threading
+    drop_rate: Optional[float] = None,
 ) -> Optional[Path]:
     """Run a single tippecanoe over [minzoom, maxzoom] using merged GeoJSON.
-    Each layer carries its own minzoom from LAYER_MIN_ZOOM_OFFSET via the
-    JSON layer-spec form of -L. Returns the produced .mbtiles path, or None
-    if there's nothing to build."""
+    Returns the produced .mbtiles path, or None if there's nothing to
+    build. drop_rate is tippecanoe's point drop rate per zoom below the
+    run's top zoom; by-band mode passes 1 (no dropping — zoom presence is
+    stamped per feature, see soundg_rule), plain mode leaves tippecanoe's
+    default of 2.5 as its only thinning."""
     merged_files = [f for f in sorted(merged_dir.glob("*.geojson"))
                     if f.stat().st_size > 100 and _geojson_has_features(f)]
     if not merged_files:
@@ -1183,17 +1390,23 @@ def run_tippecanoe_for_source(
         return None
 
     final = tile_dir / f"{stem}.mbtiles"
+    effective_drop_rate = (TIPPECANOE_DEFAULT_DROP_RATE if drop_rate is None
+                           else float(drop_rate))
 
+    # Fresh only if newer than its inputs AND built for the same zoom range
+    # AND with the same drop rate: a by-band run (rate 1) and a plain run
+    # (tippecanoe's default) over the same stem must not reuse each other.
     if (output_is_fresh(final, merged_files)
-            and _mbtiles_zoom_range(final) == (minzoom, maxzoom)):
+            and _mbtiles_zoom_range(final) == (minzoom, maxzoom)
+            and _mbtiles_drop_rate(final) == effective_drop_rate):
         print(f"  [{stem}] z{minzoom}-{maxzoom}: fresh "
               f"({final.stat().st_size / 1048576:.1f} MB), skipping")
         return final
 
     # Build per-layer JSON layer specs. A per-layer "minzoom" here would
     # be silently ignored by tippecanoe (verified v2.78.0) — zoom gating
-    # for heavy layers is instead stamped per-feature during consolidation
-    # via the `tippecanoe.minzoom` extension (see LAYER_MIN_ZOOM_OFFSET).
+    # for soundings is instead stamped per-feature during consolidation
+    # via the `tippecanoe.minzoom` extension (see soundg_rule).
     layer_args = []
     for f in merged_files:
         spec = {"file": str(f), "layer": f.stem}
@@ -1217,6 +1430,7 @@ def run_tippecanoe_for_source(
         "--buffer=80",
         "--force",
         "--temporary-directory", str(tmp),
+        *(["--drop-rate", str(drop_rate)] if drop_rate is not None else []),
         *layer_args,
     ]
     result = subprocess.run(cmd)
@@ -1227,7 +1441,7 @@ def run_tippecanoe_for_source(
             final.unlink()
         raise RuntimeError(f"tippecanoe failed for {stem}")
 
-    _patch_metadata(final, stem)
+    _patch_metadata(final, stem, effective_drop_rate)
     print(f"  [{stem}] done ({final.stat().st_size / 1048576:.1f} MB)")
     return final
 
@@ -1284,7 +1498,7 @@ class RenderSource:
     merged_dir: Path
     footprint_files: List[Path]
     zoom_range: Tuple[int, int]
-    layer_minzoom: Dict[str, int]
+    layer_rules: Dict[str, ZoomRule]
     native_zoom: Optional[Tuple[int, int]] = None
 
 
@@ -1487,13 +1701,14 @@ def _keep_own_dimension(feat: dict) -> bool:
 
 
 def erase_layer(src_file: Path, clip: Path, out_path: Path,
-                stamp_minzoom: Optional[int], gdal: GdalRunner,
+                rule: Optional[ZoomRule], gdal: GdalRunner,
                 note: Optional[str] = None) -> int:
     """Stream src_file through `ogr2ogr -clipsrc clip` and write the
     survivors as a FeatureCollection to out_path, re-applying the
-    per-feature tippecanoe minzoom stamp that the round trip drops and
-    discarding clip debris of the wrong dimension (_keep_own_dimension).
-    Returns the number of features kept."""
+    per-feature tippecanoe minzoom stamp that the round trip drops (the
+    same rule as consolidation, so a thinned layer keeps the same pick)
+    and discarding clip debris of the wrong dimension
+    (_keep_own_dimension). Returns the number of features kept."""
     tmp = out_path.with_suffix(".tmp")
     err_path = out_path.with_suffix(".stderr")
     cmd = gdal.cmd(["ogr2ogr", "-f", "GeoJSONSeq", "/vsistdout/",
@@ -1510,11 +1725,7 @@ def erase_layer(src_file: Path, clip: Path, out_path: Path,
             feat = json.loads(line)
             if not _keep_own_dimension(feat):
                 continue
-            if stamp_minzoom is not None:
-                ext = feat.get("tippecanoe")
-                ext = dict(ext) if isinstance(ext, dict) else {}
-                ext["minzoom"] = stamp_minzoom
-                feat["tippecanoe"] = ext
+            stamp_feature(feat, rule)
             if n:
                 out.write(",\n")
             json.dump(feat, out)
@@ -1573,8 +1784,9 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
           f"({fresh} fresh)...")
 
     def one(f: Path) -> Tuple[str, int]:
-        stamp = src.layer_minzoom.get(f.stem)
-        return f.stem, erase_layer(f, clip, erase_dir / f.name, stamp, gdal)
+        """Erase one merged layer; (layer name, features kept)."""
+        rule = src.layer_rules.get(f.stem)
+        return f.stem, erase_layer(f, clip, erase_dir / f.name, rule, gdal)
 
     kept: Dict[str, int] = {}
     if max_workers <= 1:
@@ -1599,7 +1811,11 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
     return erase_dir
 
 
-def _patch_metadata(mbtiles_path: Path, name: str):
+def _patch_metadata(mbtiles_path: Path, name: str,
+                    drop_rate: Optional[float] = None):
+    """Stamp type/name/description and, when given, the `drop_rate` the
+    file was rendered with (read back by _mbtiles_drop_rate for the
+    freshness check in run_tippecanoe_for_source)."""
     db = sqlite3.connect(str(mbtiles_path))
     db.execute("CREATE TABLE IF NOT EXISTS metadata (name text, value text)")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS name ON metadata (name)")
@@ -1609,6 +1825,9 @@ def _patch_metadata(mbtiles_path: Path, name: str):
                "VALUES ('name', ?)", (name,))
     db.execute("INSERT OR REPLACE INTO metadata (name, value) "
                "VALUES ('description', ?)", (name,))
+    if drop_rate is not None:
+        db.execute("INSERT OR REPLACE INTO metadata (name, value) "
+                   "VALUES ('drop_rate', ?)", (repr(float(drop_rate)),))
     db.commit()
     db.close()
 
@@ -1967,27 +2186,26 @@ def _prepare_gap_fill_group(
     merged_dir.mkdir(parents=True, exist_ok=True)
     _remove_orphan_layers(merged_dir, set(layer_groups))
 
-    # Heavy-layer minzoom stamps, offset from the group's configured
-    # bottom zoom (config-static, so cached merges stay valid).
-    layer_minzoom = {name: group.zoom_range[0] + off
-                     for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
-    force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
+    # Priority just below the band of the group's finest cells: the fill
+    # loses to that band's own run (same cells, never tiled twice) and to
+    # the native band of each zoom, and beats every coarser band.
+    cell_band = max((enc_band(Path(c)) or 3) for c in present)
+
+    # Sounding zoom rule from the group's configured bottom zoom
+    # (config-static, so cached merges stay valid).
+    layer_rules = layer_zoom_rules(cell_band, group.zoom_range[0])
+    force_stale = _stamp_marker_stale(merged_dir, layer_rules)
 
     for layer_name, files in layer_groups.items():
         out_path = merged_dir / f"{layer_name}.geojson"
         if not force_stale and output_is_fresh(out_path, files):
             continue
-        stamp = layer_minzoom.get(layer_name)
-        if len(files) == 1 and stamp is None:
+        rule = layer_rules.get(layer_name)
+        if len(files) == 1 and rule is None:
             shutil.copy2(files[0], out_path)
         else:
-            merge_geojson_layer(layer_name, files, out_path,
-                                stamp_minzoom=stamp)
+            merge_geojson_layer(layer_name, files, out_path, rule=rule)
 
-    # Priority just below the band of the group's finest cells: the fill
-    # loses to that band's own run (same cells, never tiled twice) and to
-    # the native band of each zoom, and beats every coarser band.
-    cell_band = max((enc_band(Path(c)) or 3) for c in present)
     # Footprints straight from the per-cell files: layer_groups keys are
     # the pre-underscore stem, which folds every M_* layer into "M".
     footprints = sorted(f for files in cell_files.values() for f in files
@@ -1998,7 +2216,7 @@ def _prepare_gap_fill_group(
         merged_dir=merged_dir,
         footprint_files=footprints,
         zoom_range=(effective_min, effective_max),
-        layer_minzoom=layer_minzoom)
+        layer_rules=layer_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -2396,7 +2614,8 @@ def prepare_band(
     # Stage 2: GDAL export
     export_to_geojson(
         band_enc_dir, band_geojson_dir, band_cells, label=label,
-        native_gdal=native_gdal, runtime=runtime, max_workers=max_workers)
+        native_gdal=native_gdal, runtime=runtime, max_workers=max_workers,
+        data_dir=data_dir)
 
     # Stage 2b: clip legacy cells under reschemed cells of the same band
     # (see the Stage 2b section). Returns per-cell file overrides for
@@ -2407,15 +2626,13 @@ def prepare_band(
         band_geojson_dir.with_name(f"band{band}.resolved"),
         band_merged_dir / ".same-band-overlaps.json", gdal, max_workers)
 
-    # Stage 3: Consolidate. Heavy layers get a per-feature minzoom stamp,
-    # offset from the band's NATIVE minzoom (not the CLI-effective one) so
+    # Stage 3: Consolidate. Soundings get a per-feature minzoom stamp
+    # from the band's NATIVE minzoom (not the CLI-effective one) so
     # cached merged files stay valid across zoom-argument changes.
-    band_zoom_min = BAND_ZOOM[band][0]
-    layer_minzoom = {name: band_zoom_min + off
-                     for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
+    layer_rules = layer_zoom_rules(band, BAND_ZOOM[band][0])
     merged = consolidate_geojson(band_geojson_dir, band_merged_dir,
                                  max_workers=max_workers,
-                                 layer_minzoom=layer_minzoom,
+                                 layer_rules=layer_rules,
                                  overrides=overrides)
     if not merged:
         print(f"WARNING: [{label}] nothing to render", file=sys.stderr)
@@ -2431,7 +2648,7 @@ def prepare_band(
         merged_dir=band_merged_dir,
         footprint_files=footprints,
         zoom_range=(effective_min, effective_max),
-        layer_minzoom=layer_minzoom,
+        layer_rules=layer_rules,
         native_zoom=BAND_ZOOM[band][:2])
 
 
@@ -2450,6 +2667,10 @@ def process_by_band(
     replacements: bool = True,
     catalog_path: Optional[Path] = None,
 ) -> List[Path]:
+    """The by-band pipeline: stage inputs, drop cancelled cells and fetch
+    their replacements, export per band, resolve same-band overlaps,
+    consolidate, erase finer coverage, tile each render run, clip bands
+    1-2 to the district region. Returns the tilesets for tile-join."""
     print("\n-- By-band mode ---------------------------------------------------")
 
     # Stage 1: stage all inputs
@@ -2593,9 +2814,13 @@ def process_by_band(
     tiles: List[Tuple[float, Path]] = []
 
     def _tile(run: RenderRun) -> Optional[Path]:
+        """tippecanoe for one render run; drop_rate=1 means no point
+        thinning, zoom presence is the per-feature stamp from
+        layer_rules (see soundg_rule)."""
         return run_tippecanoe_for_source(
             run_dirs[run.stem], tile_dir, run.stem,
-            run.zoom_range[0], run.zoom_range[1], max_workers=max_workers)
+            run.zoom_range[0], run.zoom_range[1], max_workers=max_workers,
+            drop_rate=1)
 
     if len(runs) <= 1 or max_workers <= 1:
         for run in runs:
@@ -2648,6 +2873,9 @@ def process_source(
     runtime: Optional[str],
     max_workers: int,
 ) -> Optional[Path]:
+    """Plain (per-input) pipeline for one source: extract, export,
+    consolidate, tile over the source's zoom range. Returns the tileset
+    or None when the source has nothing to render."""
     label = source.label or f"source{idx}"
     safe_label = re.sub(r'[^\w\-.]', '_', label)
 
@@ -2680,7 +2908,7 @@ def process_source(
         export_to_geojson(
             enc_dir, geojson_dir, enc_files, label=label,
             native_gdal=native_gdal, runtime=runtime,
-            max_workers=max_workers)
+            max_workers=max_workers, data_dir=data_dir)
 
     # Stage 3: Consolidate
     consolidated = consolidate_geojson(geojson_dir, merged_dir,

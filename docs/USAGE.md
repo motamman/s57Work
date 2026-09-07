@@ -55,7 +55,7 @@ For each band or source, the script runs these stages in order:
 6. tile-join  merge all band/source .mbtiles into the final file
 ```
 
-Every stage checks freshness by file modification time and skips work whose outputs are already newer than their inputs, so re-runs after a partial failure or an added input only redo what changed.
+Every stage checks freshness and skips work that is already up to date, so re-runs after a partial failure or an added input only redo what changed. The GDAL export keys on each cell's own edition and update numbers; the later stages key on file modification times.
 
 ### Skipped S-57 Layers
 
@@ -71,9 +71,11 @@ The SOUNDG layer gets special handling. S-57 stores soundings as MultiPointZ geo
 
 This means depth readings show up as a `DEPTH` attribute in the vector tiles, which renderers can display as labels.
 
-### Heavy Layers Start One Zoom Later
+### Soundings at a Band's Bottom Zoom
 
-In by-band mode and gap fills, dense layers (`SOUNDG`, lights, buoys, beacons, obstructions, wrecks, rocks) are held back one zoom level from their band's bottom zoom, so a band's overview zoom is not swamped with point features. The offsets live in `LAYER_MIN_ZOOM_OFFSET` at the top of the script and are stamped per feature during consolidation. Single-source mode has no band context and emits every layer from its bottom zoom.
+In by-band mode every layer renders from the bottom zoom of its band (or gap fill); tippecanoe's point thinning is switched off (`--drop-rate 1`) so nothing is silently dropped at a run's lower zooms. The one layer dense enough to need gating is `SOUNDG`: for band 3 and finer, and for gap fills, soundings render from the source's bottom zoom (never below z10), and at that bottom zoom only one in 2.5 of them is present, chosen by a hash of each sounding's identity so the choice is stable across runs and identical in the erased copies. Bands 1-2 carry soundings only at their top zoom (z8, z10). The rule lives in `soundg_rule` at the top of the script and is stamped per feature as the `tippecanoe.minzoom` extension during consolidation. Single-source mode has no band context: no stamps, and tippecanoe's default drop rate is its only thinning.
+
+Before 2026-09-07 the sounding, aids-to-navigation and hazard layers were held back one zoom from a band's bottom, which together with the finer-wins erase left the published files with `SOUNDG` at even zooms only; `count-layer-by-zoom.py` measures a layer's presence per zoom over a bounding box.
 
 ---
 
@@ -231,8 +233,8 @@ To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the 
 
 ### What gets skipped on a re-run
 
-- **Cancellation check**: one `ogrinfo` DSID read per cell, cached on the cell's file times; only new or updated cells are re-read.
-- **GDAL**: a cell is re-exported only if its `.000` or any update file is newer than its existing GeoJSON.
+- **Cancellation check and cell versions**: one `ogrinfo` DSID read per cell, cached in `data/enc/.cell-editions.json` by cell name and file time; only new or updated cells are re-read.
+- **GDAL**: a cell is re-exported only if its version (S-57 edition and update numbers, read from DSID with updates applied) differs from the one recorded in its completion marker `data/geojson/<band>/.<CELL>.exported`, or its GeoJSON is gone. An export interrupted mid-cell leaves no marker and is redone. Per-layer GDAL failures are listed in `data/geojson/<band>/.export-errors.log` and summarised on stderr.
 - **Same-band overlap resolution**: detection is cached on the cells' `M_COVR` exports and reruns only when one changes; a clipped legacy layer is redone only if its source file or the clip polygon is newer. Bands with no resolvable pair cost nothing.
 - **Consolidate**: a merged layer is rebuilt only if any of its per-cell inputs (or its clipped replacement) is newer, or the heavy-layer minzoom config changed.
 - **Erase**: the erase polygon is recomputed every run (cheap) but only rewritten when it changes; an erased layer is re-clipped only if its source layer or the erase polygon is newer.

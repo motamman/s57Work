@@ -13,6 +13,11 @@ on:
   schedule:
     - cron: '0 2 1 4-11 *'
 
+# Least privilege for the token: prepare and build only read the repo.
+# The release job raises this to contents: write for itself.
+permissions:
+  contents: read
+
 jobs:
   # ── Step 1: Read the config and produce a build matrix ──────────────
   prepare:
@@ -81,8 +86,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential libsqlite3-dev zlib1g-dev
-          git clone https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+          # Pinned: an unpinned clone builds whatever master is that day, so
+          # two runs a week apart could tile with different tippecanoe code.
+          # Bump deliberately, then re-verify a district's tiles.
+          git clone --depth 1 --branch "$TIPPECANOE_VERSION" https://github.com/felt/tippecanoe.git /tmp/tippecanoe
           cd /tmp/tippecanoe && make -j$(nproc) && sudo make install
+        env:
+          TIPPECANOE_VERSION: "2.79.0"
 
       - name: Install GDAL
         run: |

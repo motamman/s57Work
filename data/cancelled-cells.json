@@ -1,0 +1,19 @@
+{
+ "rule": "S-57 App. B.1 5.7: DSID EDTN=0 after updates = cancelled",
+ "cancelled": [
+  {
+   "cell": "US4NJ23M",
+   "band": 4,
+   "cancel_update": "1",
+   "cancelled_on": "20250915",
+   "path": "data/enc/all/input0/ENC_ROOT/US4NJ23M/US4NJ23M.000"
+  },
+  {
+   "cell": "US5NJ30M",
+   "band": 5,
+   "cancel_update": "1",
+   "cancelled_on": "20250916",
+   "path": "data/enc/all/input0/ENC_ROOT/US5NJ30M/US5NJ30M.000"
+  }
+ ]
+}

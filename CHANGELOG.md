@@ -8,6 +8,53 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- `count-layer-by-zoom.py`: a bbox reaching a pole (S=-90) raised a math
+  domain error; latitude is clamped to the Web Mercator limit first.
+  zlib-wrapped tiles were only recognised with the default 32 KB window
+  header; the full two-byte header is now checked.
+- CI workflow declares `contents: read` at the top level; only the
+  release job keeps `contents: write`.
+- A cell's export completion marker was written even when one of its
+  layers failed in `ogr2ogr`, so the next run took the cell as fresh and
+  the missing layer stayed a hole until NOAA changed the cell. Both the
+  native and the container export now leave a failed cell unmarked, so it
+  is re-exported next run; the container path also logs an `ogrinfo`
+  failure instead of silently exporting zero layers.
+- `count-layer-by-zoom.py` streams tiles from SQLite instead of loading
+  every blob of a zoom into memory (a district-wide bbox at z14 over a
+  1.9 GB file now peaks at 26 MB resident), and reports the layer's own
+  encoded bytes alongside the stored bytes of the tiles in the bbox.
+- The tippecanoe freshness check reused an existing per-run `.mbtiles`
+  whenever it was newer than its inputs and had the same zoom range,
+  ignoring the drop rate it was built with; a plain-mode file (tippecanoe's
+  default 2.5) and a by-band file (`--drop-rate 1`) for the same stem could
+  stand in for each other. Each run now stamps `drop_rate` into the
+  mbtiles metadata and a file is fresh only when it matches. Files built
+  before this carry no stamp and are rebuilt once.
+- `count-layer-by-zoom.py`: a bbox crossing the antimeridian (W > E)
+  queried an empty column range; it now reads both ranges. Sizes under
+  1 KB printed as `0KB`; they now print in bytes.
+- Published district files carried `SOUNDG` only at even zooms: none at
+  z11 and z13, a thin remainder at z15 (01CGD Narragansett: 0 / 95 / 0 /
+  3,067 / 738 / 30,757 soundings at z11-16). Lights, buoys, beacons,
+  wrecks, obstructions and rocks vanished at the same zooms. Cause: the
+  +1 zoom offset those layers got in 0.6.0 (`LAYER_MIN_ZOOM_OFFSET`)
+  started each band's copy one zoom above the band's bottom, and the
+  finer-wins erase (Stage 3b) removed the coarser band's copy under it,
+  so at z13 neither band 3 nor band 4 had soundings; tippecanoe's default
+  point drop rate (2.5 per zoom below a run's top zoom) also thinned every
+  point layer at the bottom zoom of every run. The offset is gone, and
+  by-band tippecanoe runs pass `--drop-rate 1`. Zoom presence is now
+  decided per feature (`ZoomRule`, `soundg_rule`, `feature_minzoom`):
+  only `SOUNDG` is gated — bands 1-2 keep soundings at their top zoom
+  only (z8, z10); band 3 and finer, and gap fills, carry soundings from
+  their bottom zoom (never below z10) with one in 2.5 present at that
+  zoom, picked by a hash of LNAM and position so the pick is stable and
+  the erased copy of a layer keeps it. A z13 tile carries about 1.6x the
+  soundings of a z14 tile instead of four times as many. Every merged
+  layer and tileset is rebuilt on the next run (stamp marker). New
+  `count-layer-by-zoom.py` counts one layer's features per zoom over a
+  bounding box, for before/after comparisons.
 - Dropping cancelled cells emptied z9-10 over New York Harbor, Long
   Island Sound and the Connecticut coast in the 2026-09-05 01CGD build.
   NOAA cancelled US2EC04M (2026-07-24) and files its reschemed successor
@@ -29,6 +76,22 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its last layer, and a cell without one is re-exported. Found when a
   resumed local build shipped 39 cells with most layers missing (SOUNDG
   included) at z13-16.
+- Export freshness is now keyed on the cell's own version. Each cell's
+  completion marker holds its S-57 edition and update numbers
+  (`EDTN.UPDN`, e.g. `62.0`, read from DSID with updates applied); a cell
+  is re-exported only when those differ from the marker or its outputs
+  are gone. File times no longer decide anything: unzip, copy and
+  re-download all rewrite them, and a re-downloaded but unchanged zip
+  used to re-export every cell. The DSID cache (`data/enc/
+  .cell-editions.json`) is now keyed by cell name so the per-band copies
+  hit it.
+- GDAL export failures are reported. `ogr2ogr`/`ogrinfo` stderr used to
+  be discarded, so a layer that failed to export was a silent hole in
+  the chart. Failures are appended to `data/geojson/<band>/
+  .export-errors.log` (native and container paths) and the run prints
+  the count and the first few.
+- CI pins tippecanoe to 2.79.0 (`TIPPECANOE_VERSION` in
+  `build-charts.yml`) instead of building master on every run.
 - Gap-fill groups silently rendered nothing when a configured cell had
   been cancelled: `east_maine_offshore_band3` pointed at US3EC11M
   (cancelled), which blanked the Gulf of Maine at z15-16 (121k z16 tiles
