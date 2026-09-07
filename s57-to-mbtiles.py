@@ -53,6 +53,7 @@ import sys
 import time
 import urllib.request
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,27 +81,104 @@ BAND_ZOOM: Dict[int, Tuple[int, int, str, str]] = {
 # in process_by_band for the rationale and cost history.
 BAND_ZOOM_EXTENSION = 2
 
-# Per-layer minzoom offset (in zoom levels) from a band's NATIVE minzoom.
-# Layers not listed default to 0 (emit from band's bottom zoom).
-# Heavy/dense layers get +1 so they only appear at the top of the band.
+# Zoom presence of point layers inside a source's zoom range.
 #
-# Enforcement: tippecanoe silently IGNORES a per-layer "minzoom" in the
-# -L JSON layer spec (verified against v2.78.0), so these offsets are
-# applied by stamping the feature-level `tippecanoe.minzoom` extension
-# onto each feature during consolidation (merge_geojson_layer), which
-# tippecanoe does honor. Applies in by-band mode and gap fills; plain
-# single-source mode has no band context and emits all layers from its
-# bottom zoom.
-LAYER_MIN_ZOOM_OFFSET: Dict[str, int] = {
-    # Aids to navigation — only meaningful at approach detail or finer
-    "LIGHTS": 1,
-    "BCNLAT": 1, "BCNCAR": 1, "BCNISD": 1, "BCNSPP": 1,
-    "BOYLAT": 1, "BOYCAR": 1, "BOYISD": 1, "BOYSAW": 1, "BOYSPP": 1,
-    # Hazards — same logic
-    "OBSTRN": 1, "WRECKS": 1, "UWTROC": 1,
-    # Soundings — extremely dense; push to top of band
-    "SOUNDG": 1,
-}
+# Every layer renders from the bottom zoom of its source (a band, or a
+# gap fill). Until 2026-09-07 the aids-to-navigation, hazard and SOUNDG
+# layers were held back one zoom from a band's native bottom (a +1
+# offset added in 0.6.0 as a density control), and tippecanoe's default
+# point drop rate (2.5 per zoom below a run's top zoom) thinned every
+# point layer at the bottom zoom of every run. Once the finer-wins erase
+# (Stage 3b) removed the coarser band under finer coverage, the odd
+# zooms had nothing left: band 3's extension is erased under band 4 at
+# z13 while band 4's own soundings began at z14, so the published
+# district files carried SOUNDG only at even zooms, and lights, buoys,
+# beacons, wrecks, obstructions and rocks vanished at z11/13/15 the same
+# way. Nobody re-measured the odd zooms after the erase landed.
+#
+# Now: in by-band mode tippecanoe never drops points (--drop-rate=1);
+# zoom presence is decided here, per feature, through the
+# `tippecanoe.minzoom` extension stamped during consolidation and
+# re-applied after the erase (tippecanoe silently ignores a per-layer
+# minzoom in the -L spec, verified v2.78.0). Only SOUNDG is dense enough
+# to need gating (ZoomRule, soundg_rule):
+#   * bands 1-2 (overview, general): soundings only at the band's top
+#     zoom, z8 and z10, unchanged;
+#   * band 3 and finer, and gap fills: soundings from the source's
+#     bottom zoom, never below SOUNDG_MIN_ZOOM, and at that bottom zoom
+#     only one in SOUNDG_THIN_RATE of them (the rate tippecanoe applied
+#     until now), so a z13 tile carries about 1.6x the soundings of a
+#     z14 tile (four z14 tiles' worth, thinned 2.5x) rather than four
+#     times as many. Which soundings survive at the thinned zoom is a
+#     hash of the sounding's identity (LNAM and position), so the pick
+#     is identical in the pristine and the erased copy of a layer and
+#     stable from run to run.
+# Plain single-source mode has no band context: no stamps, and
+# tippecanoe's default drop rate remains the only thinning there.
+SOUNDG_MIN_ZOOM = BAND_ZOOM[2][1]   # z10: never below the general band's top
+SOUNDG_THIN_RATE = 2.5
+SOUNDG_OVERVIEW_BANDS = (1, 2)
+
+
+@dataclass(frozen=True)
+class ZoomRule:
+    """Per-feature minzoom for one layer of one source. Features get
+    `minzoom`; with thin_rate set, only one in thin_rate of them does and
+    the rest get minzoom + 1."""
+    minzoom: int
+    thin_rate: Optional[float] = None
+
+    def as_json(self) -> list:
+        return [self.minzoom, self.thin_rate]
+
+
+def soundg_rule(band: Optional[int], bottom_zoom: int) -> ZoomRule:
+    """SOUNDG rule for a source whose data is of usage band `band` (None
+    when unknown) rendering from bottom_zoom (a band's NATIVE bottom, a
+    gap fill's configured bottom — config-static, so cached merges stay
+    valid across CLI zoom arguments)."""
+    if band in SOUNDG_OVERVIEW_BANDS:
+        return ZoomRule(BAND_ZOOM[band][1])
+    return ZoomRule(max(bottom_zoom, SOUNDG_MIN_ZOOM), SOUNDG_THIN_RATE)
+
+
+def layer_zoom_rules(band: Optional[int],
+                     bottom_zoom: int) -> Dict[str, ZoomRule]:
+    """Layer name -> ZoomRule for a by-band source. Layers not listed
+    render from the source's bottom zoom untouched."""
+    return {"SOUNDG": soundg_rule(band, bottom_zoom)}
+
+
+def feature_minzoom(feat: dict, rule: ZoomRule) -> int:
+    """The minzoom rule assigns this feature. A thinned rule keeps one in
+    thin_rate features at rule.minzoom by hashing the feature's identity
+    — its S-57 LNAM plus its 2-D position, since soundings split from one
+    MultiPoint share the LNAM — and puts the others one zoom up."""
+    if rule.thin_rate is None:
+        return rule.minzoom
+    props = feat.get("properties") or {}
+    geom = feat.get("geometry") or {}
+    coords = geom.get("coordinates")
+    # First vertex, 2-D, rounded so the GDAL round trip of the erase
+    # (which re-serialises coordinates) hashes the same.
+    while isinstance(coords, list) and coords and isinstance(coords[0], list):
+        coords = coords[0]
+    pos = ""
+    if isinstance(coords, list) and len(coords) >= 2:
+        pos = f"{round(coords[0], 6)},{round(coords[1], 6)}"
+    key = f"{props.get('LNAM', '')}|{pos}"
+    bucket = zlib.crc32(key.encode("utf-8")) % 10000
+    return rule.minzoom if bucket * rule.thin_rate < 10000 else rule.minzoom + 1
+
+
+def stamp_feature(feat: dict, rule: Optional[ZoomRule]) -> None:
+    """Apply rule to feat in place as the tippecanoe.minzoom extension."""
+    if rule is None or not isinstance(feat, dict):
+        return
+    ext = feat.get("tippecanoe")
+    ext = dict(ext) if isinstance(ext, dict) else {}
+    ext["minzoom"] = feature_minzoom(feat, rule)
+    feat["tippecanoe"] = ext
 
 # Gap-fill config lives in enc-sources.yaml under the `gap_fills:` key.
 # See the comment block in that file for full background on what gap-fill
@@ -1049,13 +1127,14 @@ echo "Export complete"
 
 def merge_geojson_layer(layer_name: str, source_files: List[Path],
                         output_path: Path,
-                        stamp_minzoom: Optional[int] = None):
+                        rule: Optional[ZoomRule] = None):
     """Merge multiple GeoJSON files into one valid FeatureCollection.
     Uses streaming writes to keep memory low.
 
-    When stamp_minzoom is set, each feature gets the tippecanoe feature
-    extension {"minzoom": N}, which tippecanoe honors natively — unlike
-    per-layer "minzoom" in the -L JSON spec, which it silently ignores."""
+    When rule is set, each feature gets the tippecanoe feature extension
+    {"minzoom": N} from feature_minzoom, which tippecanoe honors natively
+    — unlike per-layer "minzoom" in the -L JSON spec, which it silently
+    ignores."""
     with open(output_path, "w") as out:
         out.write('{"type":"FeatureCollection","features":[\n')
         first = True
@@ -1066,11 +1145,7 @@ def merge_geojson_layer(layer_name: str, source_files: List[Path],
             except (json.JSONDecodeError, OSError):
                 continue
             for feat in fc.get("features", []):
-                if stamp_minzoom is not None and isinstance(feat, dict):
-                    ext = feat.get("tippecanoe")
-                    ext = dict(ext) if isinstance(ext, dict) else {}
-                    ext["minzoom"] = stamp_minzoom
-                    feat["tippecanoe"] = ext
+                stamp_feature(feat, rule)
                 if not first:
                     out.write(",\n")
                 json.dump(feat, out)
@@ -1079,7 +1154,7 @@ def merge_geojson_layer(layer_name: str, source_files: List[Path],
 
 
 def _stamp_marker_stale(merged_dir: Path,
-                        layer_minzoom: Optional[Dict[str, int]]) -> bool:
+                        layer_rules: Optional[Dict[str, ZoomRule]]) -> bool:
     """Freshness guard for per-feature minzoom stamps baked into merged
     GeoJSON: mtime checks can't see stamp-config changes, so the applied
     config is recorded in a marker file. Returns True (treat all merged
@@ -1087,7 +1162,8 @@ def _stamp_marker_stale(merged_dir: Path,
     updates the marker."""
     merged_dir.mkdir(parents=True, exist_ok=True)
     marker = merged_dir / ".layer-minzoom.json"
-    current = json.dumps(layer_minzoom or {}, sort_keys=True)
+    current = json.dumps({k: r.as_json() for k, r in
+                          (layer_rules or {}).items()}, sort_keys=True)
     try:
         if marker.exists() and marker.read_text() == current:
             return False
@@ -1125,12 +1201,12 @@ def _write_source_marker(merged_dir: Path, sources: Dict[str, List[str]]):
 
 def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
                         max_workers: int = 1,
-                        layer_minzoom: Optional[Dict[str, int]] = None,
+                        layer_rules: Optional[Dict[str, ZoomRule]] = None,
                         overrides: Optional[Dict[str, Path]] = None
                         ) -> List[Path]:
     """Group geojson files by layer name and merge into one file per layer.
-    Returns list of merged file paths. layer_minzoom maps layer name →
-    absolute minzoom to stamp per-feature (see LAYER_MIN_ZOOM_OFFSET).
+    Returns list of merged file paths. layer_rules maps layer name → the
+    ZoomRule stamped per feature (see layer_zoom_rules).
     overrides maps a per-cell filename to a replacement file (Stage 2b's
     clipped copy of a legacy cell); a replacement with no features is
     skipped, so a fully erased cell contributes nothing."""
@@ -1160,7 +1236,7 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
     _remove_orphan_layers(merged_dir, set(layer_groups))
 
     # Per-layer freshness pre-pass (all stale if the stamp config changed)
-    force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
+    force_stale = _stamp_marker_stale(merged_dir, layer_rules)
     recorded = _read_source_marker(merged_dir)
     fresh: List[Path] = []
     stale: List[Tuple[str, List[Path], Path]] = []
@@ -1183,12 +1259,11 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
 
     def merge_one(item):
         layer_name, files, out_path = item
-        stamp = (layer_minzoom or {}).get(layer_name)
-        if len(files) == 1 and stamp is None:
+        rule = (layer_rules or {}).get(layer_name)
+        if len(files) == 1 and rule is None:
             shutil.copy2(files[0], out_path)
         else:
-            merge_geojson_layer(layer_name, files, out_path,
-                                stamp_minzoom=stamp)
+            merge_geojson_layer(layer_name, files, out_path, rule=rule)
         return out_path
 
     if max_workers <= 1:
@@ -1238,11 +1313,14 @@ def run_tippecanoe_for_source(
     minzoom: int,
     maxzoom: int,
     max_workers: int = 1,  # unused; tippecanoe handles its own threading
+    drop_rate: Optional[float] = None,
 ) -> Optional[Path]:
     """Run a single tippecanoe over [minzoom, maxzoom] using merged GeoJSON.
-    Each layer carries its own minzoom from LAYER_MIN_ZOOM_OFFSET via the
-    JSON layer-spec form of -L. Returns the produced .mbtiles path, or None
-    if there's nothing to build."""
+    Returns the produced .mbtiles path, or None if there's nothing to
+    build. drop_rate is tippecanoe's point drop rate per zoom below the
+    run's top zoom; by-band mode passes 1 (no dropping — zoom presence is
+    stamped per feature, see soundg_rule), plain mode leaves tippecanoe's
+    default of 2.5 as its only thinning."""
     merged_files = [f for f in sorted(merged_dir.glob("*.geojson"))
                     if f.stat().st_size > 100 and _geojson_has_features(f)]
     if not merged_files:
@@ -1260,8 +1338,8 @@ def run_tippecanoe_for_source(
 
     # Build per-layer JSON layer specs. A per-layer "minzoom" here would
     # be silently ignored by tippecanoe (verified v2.78.0) — zoom gating
-    # for heavy layers is instead stamped per-feature during consolidation
-    # via the `tippecanoe.minzoom` extension (see LAYER_MIN_ZOOM_OFFSET).
+    # for soundings is instead stamped per-feature during consolidation
+    # via the `tippecanoe.minzoom` extension (see soundg_rule).
     layer_args = []
     for f in merged_files:
         spec = {"file": str(f), "layer": f.stem}
@@ -1285,6 +1363,7 @@ def run_tippecanoe_for_source(
         "--buffer=80",
         "--force",
         "--temporary-directory", str(tmp),
+        *(["--drop-rate", str(drop_rate)] if drop_rate is not None else []),
         *layer_args,
     ]
     result = subprocess.run(cmd)
@@ -1352,7 +1431,7 @@ class RenderSource:
     merged_dir: Path
     footprint_files: List[Path]
     zoom_range: Tuple[int, int]
-    layer_minzoom: Dict[str, int]
+    layer_rules: Dict[str, ZoomRule]
     native_zoom: Optional[Tuple[int, int]] = None
 
 
@@ -1555,13 +1634,14 @@ def _keep_own_dimension(feat: dict) -> bool:
 
 
 def erase_layer(src_file: Path, clip: Path, out_path: Path,
-                stamp_minzoom: Optional[int], gdal: GdalRunner,
+                rule: Optional[ZoomRule], gdal: GdalRunner,
                 note: Optional[str] = None) -> int:
     """Stream src_file through `ogr2ogr -clipsrc clip` and write the
     survivors as a FeatureCollection to out_path, re-applying the
-    per-feature tippecanoe minzoom stamp that the round trip drops and
-    discarding clip debris of the wrong dimension (_keep_own_dimension).
-    Returns the number of features kept."""
+    per-feature tippecanoe minzoom stamp that the round trip drops (the
+    same rule as consolidation, so a thinned layer keeps the same pick)
+    and discarding clip debris of the wrong dimension
+    (_keep_own_dimension). Returns the number of features kept."""
     tmp = out_path.with_suffix(".tmp")
     err_path = out_path.with_suffix(".stderr")
     cmd = gdal.cmd(["ogr2ogr", "-f", "GeoJSONSeq", "/vsistdout/",
@@ -1578,11 +1658,7 @@ def erase_layer(src_file: Path, clip: Path, out_path: Path,
             feat = json.loads(line)
             if not _keep_own_dimension(feat):
                 continue
-            if stamp_minzoom is not None:
-                ext = feat.get("tippecanoe")
-                ext = dict(ext) if isinstance(ext, dict) else {}
-                ext["minzoom"] = stamp_minzoom
-                feat["tippecanoe"] = ext
+            stamp_feature(feat, rule)
             if n:
                 out.write(",\n")
             json.dump(feat, out)
@@ -1641,8 +1717,8 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
           f"({fresh} fresh)...")
 
     def one(f: Path) -> Tuple[str, int]:
-        stamp = src.layer_minzoom.get(f.stem)
-        return f.stem, erase_layer(f, clip, erase_dir / f.name, stamp, gdal)
+        rule = src.layer_rules.get(f.stem)
+        return f.stem, erase_layer(f, clip, erase_dir / f.name, rule, gdal)
 
     kept: Dict[str, int] = {}
     if max_workers <= 1:
@@ -2035,27 +2111,26 @@ def _prepare_gap_fill_group(
     merged_dir.mkdir(parents=True, exist_ok=True)
     _remove_orphan_layers(merged_dir, set(layer_groups))
 
-    # Heavy-layer minzoom stamps, offset from the group's configured
-    # bottom zoom (config-static, so cached merges stay valid).
-    layer_minzoom = {name: group.zoom_range[0] + off
-                     for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
-    force_stale = _stamp_marker_stale(merged_dir, layer_minzoom)
+    # Priority just below the band of the group's finest cells: the fill
+    # loses to that band's own run (same cells, never tiled twice) and to
+    # the native band of each zoom, and beats every coarser band.
+    cell_band = max((enc_band(Path(c)) or 3) for c in present)
+
+    # Sounding zoom rule from the group's configured bottom zoom
+    # (config-static, so cached merges stay valid).
+    layer_rules = layer_zoom_rules(cell_band, group.zoom_range[0])
+    force_stale = _stamp_marker_stale(merged_dir, layer_rules)
 
     for layer_name, files in layer_groups.items():
         out_path = merged_dir / f"{layer_name}.geojson"
         if not force_stale and output_is_fresh(out_path, files):
             continue
-        stamp = layer_minzoom.get(layer_name)
-        if len(files) == 1 and stamp is None:
+        rule = layer_rules.get(layer_name)
+        if len(files) == 1 and rule is None:
             shutil.copy2(files[0], out_path)
         else:
-            merge_geojson_layer(layer_name, files, out_path,
-                                stamp_minzoom=stamp)
+            merge_geojson_layer(layer_name, files, out_path, rule=rule)
 
-    # Priority just below the band of the group's finest cells: the fill
-    # loses to that band's own run (same cells, never tiled twice) and to
-    # the native band of each zoom, and beats every coarser band.
-    cell_band = max((enc_band(Path(c)) or 3) for c in present)
     # Footprints straight from the per-cell files: layer_groups keys are
     # the pre-underscore stem, which folds every M_* layer into "M".
     footprints = sorted(f for files in cell_files.values() for f in files
@@ -2066,7 +2141,7 @@ def _prepare_gap_fill_group(
         merged_dir=merged_dir,
         footprint_files=footprints,
         zoom_range=(effective_min, effective_max),
-        layer_minzoom=layer_minzoom)
+        layer_rules=layer_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -2476,15 +2551,13 @@ def prepare_band(
         band_geojson_dir.with_name(f"band{band}.resolved"),
         band_merged_dir / ".same-band-overlaps.json", gdal, max_workers)
 
-    # Stage 3: Consolidate. Heavy layers get a per-feature minzoom stamp,
-    # offset from the band's NATIVE minzoom (not the CLI-effective one) so
+    # Stage 3: Consolidate. Soundings get a per-feature minzoom stamp
+    # from the band's NATIVE minzoom (not the CLI-effective one) so
     # cached merged files stay valid across zoom-argument changes.
-    band_zoom_min = BAND_ZOOM[band][0]
-    layer_minzoom = {name: band_zoom_min + off
-                     for name, off in LAYER_MIN_ZOOM_OFFSET.items() if off}
+    layer_rules = layer_zoom_rules(band, BAND_ZOOM[band][0])
     merged = consolidate_geojson(band_geojson_dir, band_merged_dir,
                                  max_workers=max_workers,
-                                 layer_minzoom=layer_minzoom,
+                                 layer_rules=layer_rules,
                                  overrides=overrides)
     if not merged:
         print(f"WARNING: [{label}] nothing to render", file=sys.stderr)
@@ -2500,7 +2573,7 @@ def prepare_band(
         merged_dir=band_merged_dir,
         footprint_files=footprints,
         zoom_range=(effective_min, effective_max),
-        layer_minzoom=layer_minzoom,
+        layer_rules=layer_rules,
         native_zoom=BAND_ZOOM[band][:2])
 
 
@@ -2662,9 +2735,12 @@ def process_by_band(
     tiles: List[Tuple[float, Path]] = []
 
     def _tile(run: RenderRun) -> Optional[Path]:
+        # drop_rate=1: no tippecanoe point thinning; zoom presence is
+        # the per-feature stamp from layer_rules (see soundg_rule).
         return run_tippecanoe_for_source(
             run_dirs[run.stem], tile_dir, run.stem,
-            run.zoom_range[0], run.zoom_range[1], max_workers=max_workers)
+            run.zoom_range[0], run.zoom_range[1], max_workers=max_workers,
+            drop_rate=1)
 
     if len(runs) <= 1 or max_workers <= 1:
         for run in runs:

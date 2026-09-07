@@ -8,6 +8,27 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Published district files carried `SOUNDG` only at even zooms: none at
+  z11 and z13, a thin remainder at z15 (01CGD Narragansett: 0 / 95 / 0 /
+  3,067 / 738 / 30,757 soundings at z11-16). Lights, buoys, beacons,
+  wrecks, obstructions and rocks vanished at the same zooms. Cause: the
+  +1 zoom offset those layers got in 0.6.0 (`LAYER_MIN_ZOOM_OFFSET`)
+  started each band's copy one zoom above the band's bottom, and the
+  finer-wins erase (Stage 3b) removed the coarser band's copy under it,
+  so at z13 neither band 3 nor band 4 had soundings; tippecanoe's default
+  point drop rate (2.5 per zoom below a run's top zoom) also thinned every
+  point layer at the bottom zoom of every run. The offset is gone, and
+  by-band tippecanoe runs pass `--drop-rate 1`. Zoom presence is now
+  decided per feature (`ZoomRule`, `soundg_rule`, `feature_minzoom`):
+  only `SOUNDG` is gated — bands 1-2 keep soundings at their top zoom
+  only (z8, z10); band 3 and finer, and gap fills, carry soundings from
+  their bottom zoom (never below z10) with one in 2.5 present at that
+  zoom, picked by a hash of LNAM and position so the pick is stable and
+  the erased copy of a layer keeps it. A z13 tile carries about 1.6x the
+  soundings of a z14 tile instead of four times as many. Every merged
+  layer and tileset is rebuilt on the next run (stamp marker). New
+  `count-layer-by-zoom.py` counts one layer's features per zoom over a
+  bounding box, for before/after comparisons.
 - Dropping cancelled cells emptied z9-10 over New York Harbor, Long
   Island Sound and the Connecticut coast in the 2026-09-05 01CGD build.
   NOAA cancelled US2EC04M (2026-07-24) and files its reschemed successor

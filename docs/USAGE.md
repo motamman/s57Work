@@ -71,9 +71,11 @@ The SOUNDG layer gets special handling. S-57 stores soundings as MultiPointZ geo
 
 This means depth readings show up as a `DEPTH` attribute in the vector tiles, which renderers can display as labels.
 
-### Heavy Layers Start One Zoom Later
+### Soundings at a Band's Bottom Zoom
 
-In by-band mode and gap fills, dense layers (`SOUNDG`, lights, buoys, beacons, obstructions, wrecks, rocks) are held back one zoom level from their band's bottom zoom, so a band's overview zoom is not swamped with point features. The offsets live in `LAYER_MIN_ZOOM_OFFSET` at the top of the script and are stamped per feature during consolidation. Single-source mode has no band context and emits every layer from its bottom zoom.
+In by-band mode every layer renders from the bottom zoom of its band (or gap fill); tippecanoe's point thinning is switched off (`--drop-rate 1`) so nothing is silently dropped at a run's lower zooms. The one layer dense enough to need gating is `SOUNDG`: for band 3 and finer, and for gap fills, soundings render from the source's bottom zoom (never below z10), and at that bottom zoom only one in 2.5 of them is present, chosen by a hash of each sounding's identity so the choice is stable across runs and identical in the erased copies. Bands 1-2 carry soundings only at their top zoom (z8, z10). The rule lives in `soundg_rule` at the top of the script and is stamped per feature as the `tippecanoe.minzoom` extension during consolidation. Single-source mode has no band context: no stamps, and tippecanoe's default drop rate is its only thinning.
+
+Before 2026-09-07 the sounding, aids-to-navigation and hazard layers were held back one zoom from a band's bottom, which together with the finer-wins erase left the published files with `SOUNDG` at even zooms only; `count-layer-by-zoom.py` measures a layer's presence per zoom over a bounding box.
 
 ---
 
