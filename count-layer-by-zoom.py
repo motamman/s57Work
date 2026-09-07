@@ -5,9 +5,12 @@ count-layer-by-zoom.py — features of one layer per zoom over a bounding box
 For every zoom requested, every tile of the .mbtiles that intersects the
 bbox is read and the features of the given layer are counted. Reports,
 per zoom: tiles present in the bbox, tiles carrying the layer, feature
-count, and the stored bytes of those tiles. Use it to compare two builds
-of the same file (a layer that vanishes at some zooms, thinning that
-removes everything, size growth per zoom).
+count, and two sizes: the layer's own encoded bytes (its uncompressed
+protobuf messages summed over the tiles) and the stored bytes of every
+tile in the bbox, which is the same for all layers because a tile is one
+compressed blob. Use it to compare two builds of the same file (a layer
+that vanishes at some zooms, thinning that removes everything, size
+growth per zoom).
 
 Tiles are decoded in-process: the gzip'd Mapbox Vector Tile protobuf is
 walked just far enough to read each layer's name and count its Feature
@@ -23,7 +26,8 @@ Usage:
 With two or more files the table shows every file side by side; with
 several --layer options one table per layer. --bbox is W S E N in
 degrees. --per-tile adds the largest single-tile feature count per zoom
-(the per-tile load a thinning rule is meant to bound).
+(the per-tile load a thinning rule is meant to bound). Tiles stream from
+SQLite one at a time, so a district-wide bbox at z16 is fine.
 """
 import argparse
 import gzip
@@ -36,6 +40,7 @@ from pathlib import Path
 
 
 def lonlat_to_tile(lon, lat, z):
+    """XYZ tile (x, y) containing lon/lat at zoom z, clamped to the grid."""
     n = 1 << z
     x = int((lon + 180.0) / 360.0 * n)
     lat_r = math.radians(lat)
@@ -45,26 +50,29 @@ def lonlat_to_tile(lon, lat, z):
 
 
 def tiles_in_bbox(db, z, bbox):
-    """(x, y, tile_data) for tiles present at zoom z inside the bbox."""
+    """Yield (x, y, tile_data) for tiles present at zoom z inside the bbox,
+    one row at a time so a district-wide bbox at z16 never holds every
+    tile blob in memory at once."""
     w, s, e, n = bbox
     x0, y0 = lonlat_to_tile(w, n, z)   # top-left (XYZ)
     x1, y1 = lonlat_to_tile(e, s, z)   # bottom-right
     top = (1 << z) - 1
     # A bbox crossing the antimeridian (W > E) covers two column ranges.
     x_ranges = [(x0, x1)] if x0 <= x1 else [(x0, top), (0, x1)]
-    rows = []
     for xa, xb in x_ranges:
-        rows += db.execute(
+        cur = db.execute(
             "SELECT tile_column, tile_row, tile_data FROM tiles "
             "WHERE zoom_level=? AND tile_column BETWEEN ? AND ? "
             "AND tile_row BETWEEN ? AND ?",
-            (z, xa, xb, top - y1, top - y0)).fetchall()
-    return [(x, top - r, data) for x, r, data in rows]
+            (z, xa, xb, top - y1, top - y0))
+        for x, r, data in cur:
+            yield x, top - r, data
 
 
 # --- minimal MVT reader -----------------------------------------------------
 
 def _varint(buf, i):
+    """Decode the protobuf varint at buf[i]; return (value, next index)."""
     result = 0
     shift = 0
     while True:
@@ -77,6 +85,7 @@ def _varint(buf, i):
 
 
 def _skip(buf, i, wire_type):
+    """Index just past the protobuf field value of wire_type at buf[i]."""
     if wire_type == 0:
         _, i = _varint(buf, i)
     elif wire_type == 1:
@@ -92,6 +101,7 @@ def _skip(buf, i, wire_type):
 
 
 def _decompress(data):
+    """Raw tile bytes: MBTiles stores tiles gzip'd, zlib'd or plain."""
     if data[:2] == b"\x1f\x8b":
         return gzip.decompress(data)
     if data[:1] == b"\x78":
@@ -100,7 +110,10 @@ def _decompress(data):
 
 
 def layer_feature_counts(tile_data):
-    """{layer name: feature count} for one vector tile blob."""
+    """{layer name: (feature count, encoded bytes)} for one vector tile
+    blob. Bytes are the layer's own protobuf message size, uncompressed;
+    the only per-layer size a tile can give, since the stored blob is one
+    compressed unit."""
     buf = _decompress(tile_data)
     counts = {}
     i, end = 0, len(buf)
@@ -126,7 +139,8 @@ def layer_feature_counts(tile_data):
                 else:
                     j = _skip(layer, j, w)
             if name is not None:
-                counts[name] = counts.get(name, 0) + nfeat
+                nf, nb = counts.get(name, (0, 0))
+                counts[name] = (nf + nfeat, nb + length)
         else:
             i = _skip(buf, i, wt)
     return counts
@@ -135,30 +149,40 @@ def layer_feature_counts(tile_data):
 # ----------------------------------------------------------------------------
 
 def measure(path, layers, bbox, zooms):
+    """Per layer, per zoom: tiles in the bbox, tiles carrying the layer,
+    feature count, the largest single-tile count, the layer's encoded
+    bytes, and the stored bytes of every tile in the bbox (the same for
+    all layers; a tile is one blob)."""
     db = sqlite3.connect(str(path))
     result = {layer: {} for layer in layers}
     for z in zooms:
-        present = tiles_in_bbox(db, z, bbox)
-        per_tile = {layer: [] for layer in layers}
-        nbytes = 0
-        for _, _, data in present:
-            nbytes += len(data)
+        ntiles = 0
+        tile_bytes = 0
+        acc = {layer: {"tiles_with_layer": 0, "features": 0,
+                       "max_per_tile": 0, "layer_bytes": 0}
+               for layer in layers}
+        for _, _, data in tiles_in_bbox(db, z, bbox):
+            ntiles += 1
+            tile_bytes += len(data)
             counts = layer_feature_counts(data)
             for layer in layers:
-                per_tile[layer].append(counts.get(layer, 0))
+                nfeat, nb = counts.get(layer, (0, 0))
+                a = acc[layer]
+                a["tiles_with_layer"] += 1 if nfeat else 0
+                a["features"] += nfeat
+                a["max_per_tile"] = max(a["max_per_tile"], nfeat)
+                a["layer_bytes"] += nb
         for layer in layers:
-            c = per_tile[layer]
             result[layer][z] = {
-                "tiles": len(present),
-                "tiles_with_layer": sum(1 for n in c if n),
-                "features": sum(c),
-                "max_per_tile": max(c) if c else 0,
-                "bytes": nbytes,
+                "tiles": ntiles,
+                **acc[layer],
+                "tile_bytes": tile_bytes,
             }
     return result
 
 
 def fmt_size(nbytes):
+    """Human size: bytes below 1 KB, else KB, else MB with one decimal."""
     if nbytes >= 1048576:
         return f"{nbytes / 1048576:.1f}MB"
     if nbytes >= 1024:
@@ -167,6 +191,7 @@ def fmt_size(nbytes):
 
 
 def main():
+    """CLI entry point: parse arguments, measure each file, print tables."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mbtiles", nargs="+", type=Path)
@@ -193,7 +218,7 @@ def main():
         return
 
     names = [str(p) for p in args.mbtiles]
-    width = 34 if args.per_tile else 28
+    width = 40 if args.per_tile else 32
     for layer in args.layer:
         print(f"layer {layer}, bbox W{args.bbox[0]} S{args.bbox[1]} "
               f"E{args.bbox[2]} N{args.bbox[3]}")
@@ -201,9 +226,9 @@ def main():
         for n in names:
             print(f"  {Path(n).name[:width]:>{width}}", end="")
         print()
-        legend = "features (tiles w/ layer / tiles) bytes"
+        legend = "features (w/ layer / tiles) layerB/tileB"
         if args.per_tile:
-            legend = "features [max/tile] (w/ layer / tiles) bytes"
+            legend = "features [max/tile] (w/ layer / tiles) layerB/tileB"
         print(f"{'':>4}", end="")
         for _ in names:
             print(f"  {legend[-width:]:>{width}}", end="")
@@ -214,7 +239,8 @@ def main():
                 r = results[n][layer][z]
                 maxp = f" [{r['max_per_tile']:,}]" if args.per_tile else ""
                 cell = (f"{r['features']:,}{maxp} ({r['tiles_with_layer']}/"
-                        f"{r['tiles']}) {fmt_size(r['bytes'])}")
+                        f"{r['tiles']}) {fmt_size(r['layer_bytes'])}/"
+                        f"{fmt_size(r['tile_bytes'])}")
                 print(f"  {cell:>{width}}", end="")
             print()
         print()

@@ -5,6 +5,10 @@ data/geojson/*
 data/merged/*
 data/tiles/*
 !data/*/.gitkeep
+# NOAA product catalog: 50+ MB, refreshed daily by the tool
+data/ENCProdCat_19115.xml
+# Built tilesets never belong in the repo
+data/*.mbtiles
 
 # CI downloads
 downloads/

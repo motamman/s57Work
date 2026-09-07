@@ -129,6 +129,8 @@ class ZoomRule:
     thin_rate: Optional[float] = None
 
     def as_json(self) -> list:
+        """[minzoom, thin_rate]: the form stored in the merged-dir
+        source marker so a rule change invalidates the merged layer."""
         return [self.minzoom, self.thin_rate]
 
 
@@ -631,6 +633,7 @@ def read_cell_versions(enc_files: List[Path], data_dir: Path,
         return max(f.stat().st_mtime_ns for f in _cell_files(enc) + [enc])
 
     def key(enc: Path) -> str:
+        """Cache key: the cell name, shared by every staged copy."""
         return enc.stem.upper()
 
     todo = [e for e in enc_files
@@ -640,6 +643,7 @@ def read_cell_versions(enc_files: List[Path], data_dir: Path,
               f"{' for ' + why if why else ''}...")
 
         def one(e: Path):
+            """(cache key, DSID fields + stamp) for one cell."""
             return key(e), dict(read_cell_dsid(e, gdal), stamp=stamp(e))
 
         with ThreadPoolExecutor(max_workers=max(1, max_workers) * 2) as pool:
@@ -941,6 +945,11 @@ def export_to_geojson(
     max_workers: int = 1,
     data_dir: Optional[Path] = None,
 ) -> List[Path]:
+    """Stage 2: export every layer of every cell in enc_files to GeoJSON
+    in geojson_dir, natively or in the GDAL container. Cells whose
+    completion marker holds their current EDTN.UPDN are skipped. Returns
+    the non-empty GeoJSON files present afterwards; per-layer failures
+    are logged to EXPORT_ERROR_LOG and summarised on stderr."""
     tag = f"[{label}] " if label else ""
     multi_file = len(enc_files) > 1
     data_dir = data_dir or DATA_DIR
@@ -1004,6 +1013,7 @@ def _report_export_errors(tag: str, error_log: Path):
 
 
 def _log_export_error(error_log: Path, lock, text: str):
+    """Append one line to the export error log under the thread lock."""
     with lock:
         with open(error_log, "a") as fh:
             fh.write(text.rstrip() + "\n")
@@ -1011,6 +1021,9 @@ def _log_export_error(error_log: Path, lock, text: str):
 
 def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
                    tag, max_workers, versions: Dict[Path, str]):
+    """Native ogr2ogr export of cells_to_process, max_workers cells at a
+    time. A cell's completion marker (holding versions[cell]) is written
+    only when every non-skipped layer exported."""
     import threading
     total = len(cells_to_process)
     done = [0]
@@ -1018,6 +1031,8 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
     lock = threading.Lock()
 
     def process_enc(enc: Path):
+        """Export one cell: list its layers, drop its old outputs, run
+        ogr2ogr per layer, mark the cell complete if nothing failed."""
         name = enc.stem
         result = subprocess.run(
             ["ogrinfo", "-so", str(enc)], capture_output=True, text=True)
@@ -1044,6 +1059,7 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
             old.unlink()
         _cell_marker(geojson_dir, name).unlink(missing_ok=True)
 
+        failed = 0
         for layer in layers:
             if layer in SKIP_LAYERS:
                 continue
@@ -1056,10 +1072,18 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
             cmd.extend([str(outpath), str(enc), layer])
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0 or not outpath.exists():
+                failed += 1
                 err = (r.stderr or "").strip().splitlines()
                 _log_export_error(error_log, lock, f"{name} {layer}: "
                                   f"{err[-1] if err else 'no output'}")
-        _cell_marker(geojson_dir, name).write_text(versions[enc] + "\n")
+        # The completion marker means "every layer of this version is
+        # here". A cell with a failed layer gets none, so the next run
+        # re-exports it instead of treating the hole as fresh.
+        if failed:
+            print(f"{tag}[{name}] {failed} layer(s) failed; cell left "
+                  "unmarked for retry", file=sys.stderr)
+        else:
+            _cell_marker(geojson_dir, name).write_text(versions[enc] + "\n")
 
         done[0] += 1
         print(f"{tag}[{done[0]}/{total}] {name}")
@@ -1082,6 +1106,10 @@ def _export_native(enc_dir, geojson_dir, cells_to_process, multi_file,
 
 def _export_container(runtime, enc_dir, geojson_dir, cells_to_process,
                       multi_file, tag, label, versions: Dict[Path, str]):
+    """Same export as _export_native, run as one shell script inside the
+    GDAL container with enc_dir and geojson_dir bind-mounted. The script
+    touches a marker per fully exported cell; the version is stamped in
+    afterwards."""
     skip_case = "|".join(SKIP_LAYERS)
     name_template = "${layer}_${name}" if multi_file else "${layer}"
     # Same orphan cleanup as _export_native (see comment there).
@@ -1104,7 +1132,12 @@ for rel in $cells; do
   name=$(basename "$enc" .000)
   echo "[$i/$count] $name"
   rm -f {rm_pattern} "/output/.$name.exported"
-  layers=$(ogrinfo -so "$enc" 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{{print $2}}' | awk '{{print $1}}')
+  if ! ogrinfo -so "$enc" >/tmp/layers 2>/tmp/err; then
+    echo "$name: ogrinfo failed: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"
+    continue
+  fi
+  layers=$(grep -E '^[0-9]+:' /tmp/layers | awk -F': ' '{{print $2}}' | awk '{{print $1}}')
+  failed=0
   for layer in $layers; do
     case "$layer" in {skip_case}) continue ;; esac
     outname="{name_template}"
@@ -1112,13 +1145,18 @@ for rel in $cells; do
     if [ "$layer" = "SOUNDG" ]; then
       ogr2ogr -f GeoJSON -oo SPLIT_MULTIPOINT=YES -oo ADD_SOUNDG_DEPTH=YES \
         -oo LIST_AS_STRING=YES \
-        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"
+        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || {{ echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"; failed=1; }}
     else
       ogr2ogr -f GeoJSON -oo LIST_AS_STRING=YES \
-        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"
+        "/output/$outname.geojson" "$enc" "$layer" 2>/tmp/err || {{ echo "$name $layer: $(tail -n1 /tmp/err)" >> "/output/{EXPORT_ERROR_LOG}"; failed=1; }}
     fi
   done
-  touch "/output/.$name.exported"
+  # Marker only when every layer exported (see _export_native).
+  if [ "$failed" = 0 ]; then
+    touch "/output/.$name.exported"
+  else
+    echo "$name: layer failure(s); cell left unmarked for retry" >&2
+  fi
 done
 echo "Export complete"
 """
@@ -1133,8 +1171,8 @@ echo "Export complete"
     if result.returncode != 0:
         print(f"ERROR: GDAL export failed ({label})", file=sys.stderr)
         sys.exit(1)
-    # The container touches a marker per completed cell; stamp the
-    # version into every marker it left behind.
+    # The container touches a marker per cell whose every layer exported;
+    # stamp the version into every marker it left behind.
     for enc in cells_to_process:
         marker = _cell_marker(geojson_dir, enc.stem)
         if marker.exists():
@@ -1207,6 +1245,8 @@ def _source_identity(src: Path, geojson_dir: Path) -> str:
 
 
 def _read_source_marker(merged_dir: Path) -> Dict[str, List[str]]:
+    """The merged dir's record of what each layer was built from
+    (see _write_source_marker); empty when missing or unreadable."""
     try:
         data = json.loads((merged_dir / SOURCE_MARKER).read_text())
         return data if isinstance(data, dict) else {}
@@ -1278,6 +1318,7 @@ def consolidate_geojson(geojson_dir: Path, merged_dir: Path,
           f"(others fresh)...")
 
     def merge_one(item):
+        """Merge one layer's per-cell files into out_path with its rule."""
         layer_name, files, out_path = item
         rule = (layer_rules or {}).get(layer_name)
         if len(files) == 1 and rule is None:
@@ -1743,6 +1784,7 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
           f"({fresh} fresh)...")
 
     def one(f: Path) -> Tuple[str, int]:
+        """Erase one merged layer; (layer name, features kept)."""
         rule = src.layer_rules.get(f.stem)
         return f.stem, erase_layer(f, clip, erase_dir / f.name, rule, gdal)
 
@@ -2625,6 +2667,10 @@ def process_by_band(
     replacements: bool = True,
     catalog_path: Optional[Path] = None,
 ) -> List[Path]:
+    """The by-band pipeline: stage inputs, drop cancelled cells and fetch
+    their replacements, export per band, resolve same-band overlaps,
+    consolidate, erase finer coverage, tile each render run, clip bands
+    1-2 to the district region. Returns the tilesets for tile-join."""
     print("\n-- By-band mode ---------------------------------------------------")
 
     # Stage 1: stage all inputs
@@ -2768,8 +2814,9 @@ def process_by_band(
     tiles: List[Tuple[float, Path]] = []
 
     def _tile(run: RenderRun) -> Optional[Path]:
-        # drop_rate=1: no tippecanoe point thinning; zoom presence is
-        # the per-feature stamp from layer_rules (see soundg_rule).
+        """tippecanoe for one render run; drop_rate=1 means no point
+        thinning, zoom presence is the per-feature stamp from
+        layer_rules (see soundg_rule)."""
         return run_tippecanoe_for_source(
             run_dirs[run.stem], tile_dir, run.stem,
             run.zoom_range[0], run.zoom_range[1], max_workers=max_workers,
@@ -2826,6 +2873,9 @@ def process_source(
     runtime: Optional[str],
     max_workers: int,
 ) -> Optional[Path]:
+    """Plain (per-input) pipeline for one source: extract, export,
+    consolidate, tile over the source's zoom range. Returns the tileset
+    or None when the source has nothing to render."""
     label = source.label or f"source{idx}"
     safe_label = re.sub(r'[^\w\-.]', '_', label)
 

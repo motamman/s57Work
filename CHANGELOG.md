@@ -8,6 +8,16 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- A cell's export completion marker was written even when one of its
+  layers failed in `ogr2ogr`, so the next run took the cell as fresh and
+  the missing layer stayed a hole until NOAA changed the cell. Both the
+  native and the container export now leave a failed cell unmarked, so it
+  is re-exported next run; the container path also logs an `ogrinfo`
+  failure instead of silently exporting zero layers.
+- `count-layer-by-zoom.py` streams tiles from SQLite instead of loading
+  every blob of a zoom into memory (a district-wide bbox at z14 over a
+  1.9 GB file now peaks at 26 MB resident), and reports the layer's own
+  encoded bytes alongside the stored bytes of the tiles in the bbox.
 - The tippecanoe freshness check reused an existing per-run `.mbtiles`
   whenever it was newer than its inputs and had the same zoom range,
   ignoring the drop rate it was built with; a plain-mode file (tippecanoe's
