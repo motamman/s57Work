@@ -8,6 +8,16 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- The tippecanoe freshness check reused an existing per-run `.mbtiles`
+  whenever it was newer than its inputs and had the same zoom range,
+  ignoring the drop rate it was built with; a plain-mode file (tippecanoe's
+  default 2.5) and a by-band file (`--drop-rate 1`) for the same stem could
+  stand in for each other. Each run now stamps `drop_rate` into the
+  mbtiles metadata and a file is fresh only when it matches. Files built
+  before this carry no stamp and are rebuilt once.
+- `count-layer-by-zoom.py`: a bbox crossing the antimeridian (W > E)
+  queried an empty column range; it now reads both ranges. Sizes under
+  1 KB printed as `0KB`; they now print in bytes.
 - Published district files carried `SOUNDG` only at even zooms: none at
   z11 and z13, a thin remainder at z15 (01CGD Narragansett: 0 / 95 / 0 /
   3,067 / 738 / 30,757 soundings at z11-16). Lights, buoys, beacons,

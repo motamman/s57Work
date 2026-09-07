@@ -50,11 +50,15 @@ def tiles_in_bbox(db, z, bbox):
     x0, y0 = lonlat_to_tile(w, n, z)   # top-left (XYZ)
     x1, y1 = lonlat_to_tile(e, s, z)   # bottom-right
     top = (1 << z) - 1
-    rows = db.execute(
-        "SELECT tile_column, tile_row, tile_data FROM tiles "
-        "WHERE zoom_level=? AND tile_column BETWEEN ? AND ? "
-        "AND tile_row BETWEEN ? AND ?",
-        (z, x0, x1, top - y1, top - y0)).fetchall()
+    # A bbox crossing the antimeridian (W > E) covers two column ranges.
+    x_ranges = [(x0, x1)] if x0 <= x1 else [(x0, top), (0, x1)]
+    rows = []
+    for xa, xb in x_ranges:
+        rows += db.execute(
+            "SELECT tile_column, tile_row, tile_data FROM tiles "
+            "WHERE zoom_level=? AND tile_column BETWEEN ? AND ? "
+            "AND tile_row BETWEEN ? AND ?",
+            (z, xa, xb, top - y1, top - y0)).fetchall()
     return [(x, top - r, data) for x, r, data in rows]
 
 
@@ -157,7 +161,9 @@ def measure(path, layers, bbox, zooms):
 def fmt_size(nbytes):
     if nbytes >= 1048576:
         return f"{nbytes / 1048576:.1f}MB"
-    return f"{nbytes / 1024:.0f}KB"
+    if nbytes >= 1024:
+        return f"{nbytes / 1024:.0f}KB"
+    return f"{nbytes}B"
 
 
 def main():

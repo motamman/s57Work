@@ -460,6 +460,26 @@ def _mbtiles_zoom_range(path: Path) -> Optional[Tuple[int, int]]:
         return None
 
 
+# tippecanoe's default --drop-rate; what a run without an explicit rate
+# was built with (recorded in the mbtiles metadata, see _patch_metadata).
+TIPPECANOE_DEFAULT_DROP_RATE = 2.5
+
+
+def _mbtiles_drop_rate(path: Path) -> Optional[float]:
+    """The drop rate an mbtiles was rendered with, from the `drop_rate`
+    metadata key _patch_metadata writes; None if absent or unreadable, so
+    a file built before the key existed (or by a different tippecanoe
+    invocation) is never reused as fresh."""
+    try:
+        db = sqlite3.connect(path)
+        row = db.execute("SELECT value FROM metadata "
+                         "WHERE name = 'drop_rate'").fetchone()
+        db.close()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
 def _cell_marker(geojson_dir: Path, cell: str) -> Path:
     """Completion marker written after the LAST layer of a cell is
     exported, holding the cell version (cell_version) the export was made
@@ -1329,9 +1349,15 @@ def run_tippecanoe_for_source(
         return None
 
     final = tile_dir / f"{stem}.mbtiles"
+    effective_drop_rate = (TIPPECANOE_DEFAULT_DROP_RATE if drop_rate is None
+                           else float(drop_rate))
 
+    # Fresh only if newer than its inputs AND built for the same zoom range
+    # AND with the same drop rate: a by-band run (rate 1) and a plain run
+    # (tippecanoe's default) over the same stem must not reuse each other.
     if (output_is_fresh(final, merged_files)
-            and _mbtiles_zoom_range(final) == (minzoom, maxzoom)):
+            and _mbtiles_zoom_range(final) == (minzoom, maxzoom)
+            and _mbtiles_drop_rate(final) == effective_drop_rate):
         print(f"  [{stem}] z{minzoom}-{maxzoom}: fresh "
               f"({final.stat().st_size / 1048576:.1f} MB), skipping")
         return final
@@ -1374,7 +1400,7 @@ def run_tippecanoe_for_source(
             final.unlink()
         raise RuntimeError(f"tippecanoe failed for {stem}")
 
-    _patch_metadata(final, stem)
+    _patch_metadata(final, stem, effective_drop_rate)
     print(f"  [{stem}] done ({final.stat().st_size / 1048576:.1f} MB)")
     return final
 
@@ -1743,7 +1769,11 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
     return erase_dir
 
 
-def _patch_metadata(mbtiles_path: Path, name: str):
+def _patch_metadata(mbtiles_path: Path, name: str,
+                    drop_rate: Optional[float] = None):
+    """Stamp type/name/description and, when given, the `drop_rate` the
+    file was rendered with (read back by _mbtiles_drop_rate for the
+    freshness check in run_tippecanoe_for_source)."""
     db = sqlite3.connect(str(mbtiles_path))
     db.execute("CREATE TABLE IF NOT EXISTS metadata (name text, value text)")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS name ON metadata (name)")
@@ -1753,6 +1783,9 @@ def _patch_metadata(mbtiles_path: Path, name: str):
                "VALUES ('name', ?)", (name,))
     db.execute("INSERT OR REPLACE INTO metadata (name, value) "
                "VALUES ('description', ?)", (name,))
+    if drop_rate is not None:
+        db.execute("INSERT OR REPLACE INTO metadata (name, value) "
+                   "VALUES ('drop_rate', ?)", (repr(float(drop_rate)),))
     db.commit()
     db.close()
 
