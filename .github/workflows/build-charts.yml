@@ -13,6 +13,11 @@ on:
   schedule:
     - cron: '0 2 1 4-11 *'
 
+# Least privilege for the token: prepare and build only read the repo.
+# The release job raises this to contents: write for itself.
+permissions:
+  contents: read
+
 jobs:
   # ── Step 1: Read the config and produce a build matrix ──────────────
   prepare:

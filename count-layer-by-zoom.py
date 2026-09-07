@@ -43,6 +43,8 @@ def lonlat_to_tile(lon, lat, z):
     """XYZ tile (x, y) containing lon/lat at zoom z, clamped to the grid."""
     n = 1 << z
     x = int((lon + 180.0) / 360.0 * n)
+    # Web Mercator is undefined at the poles; clamp so S=-90 cannot raise.
+    lat = min(max(lat, -85.0511287798066), 85.0511287798066)
     lat_r = math.radians(lat)
     y = int((1.0 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi)
             / 2.0 * n)
@@ -104,7 +106,11 @@ def _decompress(data):
     """Raw tile bytes: MBTiles stores tiles gzip'd, zlib'd or plain."""
     if data[:2] == b"\x1f\x8b":
         return gzip.decompress(data)
-    if data[:1] == b"\x78":
+    # zlib header: CM=8 (deflate), CINFO<=7, and the two bytes as a
+    # big-endian integer divisible by 31. 0x78 is only the default
+    # 32 KB window; smaller windows give 0x08..0x68 first bytes.
+    if (len(data) >= 2 and (data[0] & 0x0F) == 8 and data[0] >> 4 <= 7
+            and ((data[0] << 8) | data[1]) % 31 == 0):
         return zlib.decompress(data)
     return data
 

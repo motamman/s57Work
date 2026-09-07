@@ -8,6 +8,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- `count-layer-by-zoom.py`: a bbox reaching a pole (S=-90) raised a math
+  domain error; latitude is clamped to the Web Mercator limit first.
+  zlib-wrapped tiles were only recognised with the default 32 KB window
+  header; the full two-byte header is now checked.
+- CI workflow declares `contents: read` at the top level; only the
+  release job keeps `contents: write`.
 - A cell's export completion marker was written even when one of its
   layers failed in `ogr2ogr`, so the next run took the cell as fresh and
   the missing layer stayed a hole until NOAA changed the cell. Both the
