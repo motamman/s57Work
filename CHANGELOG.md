@@ -7,6 +7,20 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Test suite (`tests/`, standard-library `unittest`): 82 unit tests over
+  cell/layer naming, the SOUNDG zoom rule and hash thinning, the
+  finer-wins render plan, resume freshness, consolidation and overrides,
+  clip-debris removal, tile arithmetic and the region mask, catalog
+  parsing, same-band overlap resolution, gap-fill config and the MVT
+  reader in `count-layer-by-zoom.py`; plus an end-to-end test that runs
+  the by-band pipeline on `tests/fixtures/mini-district.zip` (US4NY1BY
+  with US5RI1AC/AD/AE nested inside it and the cancelled US5NJ30M) and
+  decodes the tiles: cancelled cell dropped, SOUNDG and every point
+  layer present at z13/14/15/16 with the bottom zoom thinned, one chart
+  per tile inside band 5, band 4 extension outside it, second run
+  rebuilds nothing. `.github/workflows/tests.yml` runs it on every push.
+
 ### Fixed
 - `count-layer-by-zoom.py`: a bbox reaching a pole (S=-90) raised a math
   domain error; latitude is clamped to the Web Mercator limit first.

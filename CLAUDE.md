@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Single-script Python tool (`s57-to-mbtiles.py`) that converts NOAA S-57 ENC nautical charts (`.000` files) into vector MBTiles for use with SignalK / Freeboard-SK.
 
-There are no tests or linting configured for this project.
+Tests: `python3 -m unittest discover -s tests -t .` (standard library only, no pytest). Unit tests cover naming, zoom rules, the render plan, freshness, consolidation, geometry, catalog parsing and the MVT counter; `tests/test_pipeline.py` runs the whole by-band pipeline on `tests/fixtures/mini-district.zip` (a band 4 cell, three nested band 5 cells, one cancelled cell) and decodes the tiles per zoom — it skips when GDAL or tippecanoe is missing. `.github/workflows/tests.yml` runs both on every push and PR. Rebuild the fixture with `tests/fixtures/make-fixture.py`. No linting is configured.
 
 ## External Dependencies
 
@@ -65,6 +65,7 @@ check-tile-overlap.py       # diagnostic: shared tile addresses between tilesets
 check-tile-duplicates.py    # diagnostic: chart cells stacked and exact duplicate features per tile in a merged file
 count-layer-by-zoom.py      # diagnostic: one layer's feature count per zoom over a bbox (compare builds)
 verify-r2-charts.py         # downloads each published district file, measures coverage gaps and stacking, writes a report
+tests/                      # unittest suite; tests/fixtures/mini-district.zip is the five-cell end-to-end fixture
 pyproject.toml              # project metadata; the version lives here and nowhere else
 enc-sources.yaml            # CI build definitions
 docs/
