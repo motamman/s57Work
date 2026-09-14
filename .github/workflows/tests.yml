@@ -4,12 +4,19 @@ on:
   push:
   pull_request:
 
+# The jobs only read the repo and run its Python; the token needs
+# nothing more, and the checked-out tree must not carry it.
+permissions:
+  contents: read
+
 jobs:
   unit:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install pyyaml
         run: pip install pyyaml
       - name: Run unit tests (pipeline test skips without GDAL/tippecanoe)
@@ -20,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install GDAL and pyyaml
         run: |
           sudo apt-get update -qq
