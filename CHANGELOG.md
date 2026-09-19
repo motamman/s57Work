@@ -8,6 +8,19 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `--pmtiles`: also write the final tileset as a PMTiles archive beside
+  the `.mbtiles`, via go-pmtiles' `pmtiles convert` run after the
+  metadata patch so `type=S-57`, `name`, bounds and `vector_layers`
+  carry over (tile-join's own PMTiles output resets the type to
+  `overlay`). Tiles are copied byte-for-byte and deduplicated; on a
+  district file the archive is smaller than the SQLite original. The
+  chart build workflow installs go-pmtiles 1.31.2, passes the flag, and
+  publishes `<district>.pmtiles` next to `<district>.mbtiles` in the
+  release and on R2; the per-chart `.json` gains `pmtiles_file_size_mb`.
+  Tests: `tests/test_pmtiles.py` (dependency check, conversion of a
+  tippecanoe-built tileset, failure leaves no partial file) and the
+  pipeline test decode `.mbtiles` and `.pmtiles` and require identical
+  tiles and metadata; both skip without the tool.
 - Test suite (`tests/`, standard-library `unittest`): 82 unit tests over
   cell/layer naming, the SOUNDG zoom rule and hash thinning, the
   finer-wins render plan, resume freshness, consolidation and overrides,

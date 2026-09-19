@@ -42,5 +42,14 @@ jobs:
           git clone --depth 1 --branch "$TIPPECANOE_VERSION" https://github.com/felt/tippecanoe.git /tmp/tippecanoe
           cd /tmp/tippecanoe && make -j$(nproc) && sudo make install
           tippecanoe --version
+      - name: Install go-pmtiles (writes the .pmtiles copy)
+        env:
+          # Pinned like tippecanoe; bump deliberately.
+          PMTILES_VERSION: "1.31.2"
+        run: |
+          curl -fsSL "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C /tmp pmtiles
+          sudo install -m 755 /tmp/pmtiles /usr/local/bin/pmtiles
+          pmtiles version
       - name: Run the full suite
         run: python3 -m unittest discover -s tests -t . -v

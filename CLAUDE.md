@@ -12,6 +12,7 @@ Tests: `python3 -m unittest discover -s tests -t .` (standard library only, no p
 
 - **GDAL** (`ogr2ogr`, `ogrinfo`) — native install or via container (`ghcr.io/osgeo/gdal:alpine-small-latest`) using podman/docker. By-band mode also needs the SQLite dialect's spatial functions (`ST_Union`, `ST_Difference`), i.e. a GDAL built with SpatiaLite or GEOS; Ubuntu's `gdal-bin` and Homebrew's `gdal` both qualify (verified Sept 2026)
 - **tippecanoe + tile-join** — converts GeoJSON to vector `.mbtiles` tiles (native install)
+- **go-pmtiles** (`pmtiles`) — optional; `--pmtiles` converts the finished `.mbtiles` into a sibling `.pmtiles` archive (`write_pmtiles`). Runs after `_patch_metadata` so `type=S-57` and `vector_layers` carry over; tile-join's own PMTiles output would reset the type to `overlay`. The `.mbtiles` stays the master for resume and the diagnostics. Pinned to 1.31.2 in both workflows
 - **Python 3** — standard library only
 
 ## Running
@@ -40,6 +41,7 @@ Single-file pipeline with five stages per band/source:
 5. **Erase** (by-band only) — for zooms where a band overlaps a finer band, `ogr2ogr -clipsrc` removes the finer band's chart footprints (`M_COVR`, `CATCOV=1`) from its features, into `data/merged/<band>.minus-<finer>/`
 6. **tippecanoe** — builds one `.mbtiles` per band and zoom group in `data/tiles/` with `--no-tile-size-limit --no-feature-limit`
 7. **tile-join** — merges all tilesets into one final `.mbtiles`. tile-join does **not** let a later input win: overlapping layers are merged feature-by-feature, which is why the erase stage exists
+8. **PMTiles** (`--pmtiles`, on in CI) — `pmtiles convert` writes `<name>.pmtiles` beside the final file; tiles are copied byte-for-byte and deduplicated. `tests/test_pmtiles.py` and the pipeline test decode both files and require identical tiles and metadata
 
 All artifacts stored in `./data/` and preserved between runs for resume capability.
 

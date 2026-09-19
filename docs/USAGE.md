@@ -11,6 +11,7 @@ Convert NOAA S-57 ENC charts (`.000` files) into vector MBTiles for use with Sig
 | **GDAL** (`ogr2ogr`, `ogrinfo`) | Converts S-57 layers to GeoJSON. Native install is used when found; otherwise the script runs the `ghcr.io/osgeo/gdal:alpine-small-latest` container via **podman** or **docker** | System package manager, or podman/docker |
 | **tippecanoe** | Converts GeoJSON into vector `.mbtiles` tiles | Build from source or package manager |
 | **tile-join** | Merges multiple `.mbtiles` into one (ships with tippecanoe) | Included with tippecanoe |
+| **go-pmtiles** (`pmtiles`) | Optional: writes the `.pmtiles` copy of the final tileset when `--pmtiles` is given | `brew install pmtiles`, or a [release binary](https://github.com/protomaps/go-pmtiles/releases) |
 | **Python 3** | Runs the script itself | Pre-installed on most systems |
 
 No Python dependencies beyond the standard library. `pyyaml` is optional: without it the gap-fill config in `enc-sources.yaml` is skipped with a warning.
@@ -194,6 +195,7 @@ In practice the freshness checks make this mode rarely necessary: re-running the
 | `-j, --jobs` | Parallel workers for GDAL export, consolidation, and bands | half the CPU count |
 | `--catalog XML` | By-band: use this NOAA ENC product catalog instead of downloading `ENCProdCat_19115.xml` into `data/` (refreshed daily) | download |
 | `--no-replacements` | By-band: do not fetch the reschemed cells that replace cancelled cells from NOAA's catalog | fetch |
+| `--pmtiles` | Also write `<name>.pmtiles` beside the final `.mbtiles` (and into `--output-dir`): the same tiles, layers and metadata as a single-file PMTiles archive. Needs go-pmtiles' `pmtiles` on PATH | off |
 
 ---
 
@@ -224,7 +226,8 @@ data/
     ├── band3-coastal_z13-14.minus-band4-approach.mbtiles  # extended zooms
     ├── band2-general.region.mbtiles  # band 1/2 clipped copies fed to tile-join
     ├── gapfill-<name>*.mbtiles
-    └── <output name>.mbtiles   # final merged file
+    ├── <output name>.mbtiles   # final merged file
+    └── <output name>.pmtiles   # with --pmtiles: the same tiles as a PMTiles archive
 ```
 
 For standard (non-by-band) mode the per-source directories are named after the input file (`data/enc/NY_ENCs.zip/`, `data/geojson/NY_ENCs.zip/`, …) and the tippecanoe outputs are `data/tiles/s1.mbtiles`, `s2.mbtiles`, ….
@@ -254,6 +257,14 @@ To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the 
 ## Output
 
 The final `.mbtiles` file is a standard MBTiles v1.3 vector tileset, written to `data/tiles/<name>.mbtiles` and copied to `--output-dir` if given. Metadata is patched to set `type=S-57` and `name`/`description` to the output stem. In by-band mode the declared bounds reflect the district region, not the full extent of its overview cells.
+
+### PMTiles copy (`--pmtiles`)
+
+With `--pmtiles` the final tileset is also written as `data/tiles/<name>.pmtiles` (and copied to `--output-dir`). It is produced from the finished, metadata-patched `.mbtiles` by go-pmtiles' `pmtiles convert`, so it is a faithful mirror: the gzipped MVT tile blobs are copied unchanged, deduplicated and clustered, and the metadata table (`type=S-57`, `name`, `description`, bounds, zooms, `vector_layers`) becomes the archive's JSON metadata. Decoding both files tile by tile gives identical features. The archive is usually smaller than the `.mbtiles` because the erase stage leaves many identical near-empty coverage tiles, which PMTiles stores once. The `.mbtiles` stays the master copy — the resume logic and the diagnostic scripts read it, and the archive is regenerated every run.
+
+tile-join can emit PMTiles directly, but it resets the metadata `type` to `overlay` and an archive's JSON metadata cannot be patched in place, which is why the conversion runs last instead.
+
+A PMTiles file is served by [signalk-pmtiles-plugin](https://github.com/panaaj/signalk-pmtiles-plugin) or any host that supports HTTP range requests (S3/R2, plain nginx); the [pmtiles](https://github.com/protomaps/PMTiles) JavaScript library reads it in MapLibre and OpenLayers. Note that the Signal K PMTiles plugin currently types every archive as `tilelayer` rather than reading the `S-57` stamp.
 
 ### Using with SignalK
 

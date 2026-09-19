@@ -321,6 +321,10 @@ Skip GDAL (use existing GeoJSON):
     parser.add_argument("--no-replacements", action="store_true",
                         help="Do not fetch the reschemed cells that replace "
                              "cancelled ones from NOAA's catalog (by-band)")
+    parser.add_argument("--pmtiles", action="store_true",
+                        help="Also write a PMTiles archive of the final "
+                             "tileset beside it (same tiles, layers and "
+                             "metadata; needs go-pmtiles' `pmtiles` on PATH)")
     return parser
 
 
@@ -400,12 +404,15 @@ def find_container_runtime() -> Optional[str]:
     return None
 
 
-def check_deps(need_gdal: bool = True) -> Tuple[bool, Optional[str]]:
+def check_deps(need_gdal: bool = True,
+               need_pmtiles: bool = False) -> Tuple[bool, Optional[str]]:
     errors = []
     if not shutil.which("tippecanoe"):
         errors.append("tippecanoe not found.")
     if not shutil.which("tile-join"):
         errors.append("tile-join not found.")
+    if need_pmtiles and not shutil.which("pmtiles"):
+        errors.append("pmtiles not found (go-pmtiles); needed for --pmtiles.")
     native_gdal = bool(shutil.which("ogr2ogr") and shutil.which("ogrinfo"))
     runtime = find_container_runtime()
     if need_gdal and not native_gdal and not runtime:
@@ -2040,6 +2047,36 @@ def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
     print(f"Merged -> {output_path} ({output_path.stat().st_size / 1048576:.1f} MB)")
 
 
+def write_pmtiles(mbtiles_path: Path) -> Path:
+    """Write a PMTiles archive beside the final MBTiles with go-pmtiles'
+    `pmtiles convert`. The MBTiles stays the master: the gzipped MVT
+    blobs are copied unchanged (deduplicated and clustered), and the
+    metadata table — bounds, zooms, `vector_layers` and the `type=S-57`
+    stamp from _patch_metadata — becomes the archive's JSON metadata.
+    tile-join can also emit PMTiles, but it resets `type` to `overlay`
+    and an archive's JSON metadata cannot be patched in place, so the
+    conversion runs after the stamp. Regenerated every run, like the
+    final MBTiles it mirrors."""
+    out = mbtiles_path.with_suffix(".pmtiles")
+    tmp = out.with_name(out.name + ".tmp")
+    cmd = ["pmtiles", "convert", str(mbtiles_path), str(tmp), "--force",
+           "--tmpdir", str(mbtiles_path.parent)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    ok = result.returncode == 0 and tmp.exists()
+    if ok:
+        with open(tmp, "rb") as f:
+            ok = f.read(7) == b"PMTiles"
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        tail = (result.stderr or result.stdout or "").strip().splitlines()
+        print("ERROR: pmtiles convert failed"
+              + (f": {tail[-1]}" if tail else ""), file=sys.stderr)
+        sys.exit(1)
+    os.replace(tmp, out)
+    print(f"PMTiles -> {out} ({out.stat().st_size / 1048576:.1f} MB)")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Gap fill: render high-band detail cells at lower zooms to cover
 #           documented NOAA legacy-ENC coverage holes.
@@ -2940,7 +2977,7 @@ def main():
         prod_path = prod_dir / out_name
 
     native_gdal, runtime = check_deps(
-        need_gdal=not args.geojson_dir)
+        need_gdal=not args.geojson_dir, need_pmtiles=args.pmtiles)
     if not native_gdal and runtime:
         pull_image(runtime, GDAL_IMAGE)
 
@@ -3007,9 +3044,13 @@ def main():
 
     size_mb = tiles_path.stat().st_size / 1048576
     print(f"  Tiles: {tiles_path} ({size_mb:.1f} MB)")
+    pmtiles_path = write_pmtiles(tiles_path) if args.pmtiles else None
     if prod_path:
         shutil.copy2(tiles_path, prod_path)
         print(f"  Copied: {prod_path}")
+        if pmtiles_path:
+            shutil.copy2(pmtiles_path, prod_path.with_suffix(".pmtiles"))
+            print(f"  Copied: {prod_path.with_suffix('.pmtiles')}")
     print(f"\nAll data preserved in {data_dir.resolve()}/")
 
 

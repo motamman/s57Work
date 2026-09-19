@@ -21,6 +21,17 @@ sudo make install
 tippecanoe --version
 ```
 
+### go-pmtiles (optional, for `--pmtiles`)
+
+```bash
+V=1.31.2
+curl -fsSL "https://github.com/protomaps/go-pmtiles/releases/download/v${V}/go-pmtiles_${V}_Linux_arm64.tar.gz" | tar xz -C /tmp pmtiles
+sudo install -m 755 /tmp/pmtiles /usr/local/bin/pmtiles
+pmtiles version
+```
+
+(Use `Linux_x86_64` on an Intel/AMD machine.)
+
 ### Podman
 
 ```bash
@@ -41,6 +52,12 @@ podman pull ghcr.io/osgeo/gdal:alpine-small-latest
 
 ```bash
 brew install tippecanoe
+```
+
+### go-pmtiles (optional, for `--pmtiles`)
+
+```bash
+brew install pmtiles
 ```
 
 ### Docker or Podman

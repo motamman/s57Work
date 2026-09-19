@@ -13,7 +13,9 @@ What is pinned here, and why:
   * finer wins: inside a band 5 cell at z15-16 exactly one chart's
     M_COVR is in the tile and no feature is duplicated; outside the band
     5 cells the band 4 extension still provides the chart;
-  * a second run rebuilds nothing.
+  * a second run rebuilds nothing;
+  * with go-pmtiles installed, the --pmtiles archive holds the same tiles
+    and metadata as the MBTiles it mirrors.
 """
 import json
 import shutil
@@ -40,6 +42,8 @@ class ByBandPipeline(unittest.TestCase):
         shutil.copy(h.FIXTURE_ZIP, cls.zip)
         cls.args = (str(cls.zip), "--by-band", "--no-replacements", "-j", "2",
                     "-o", "mini.mbtiles")
+        if h.HAVE_PMTILES:
+            cls.args += ("--pmtiles",)
         cls.first = h.run_pipeline(cls.work, *cls.args)
         cls.out = cls.work / "data" / "tiles" / "mini.mbtiles"
         if cls.first.returncode != 0 or not cls.out.exists():
@@ -128,6 +132,28 @@ class ByBandPipeline(unittest.TestCase):
             covr = [f for f in layers.get("M_COVR", [])
                     if f["properties"].get("CATCOV") == 1]
             self.assertEqual(len(covr), 1)
+
+    # -- PMTiles copy --------------------------------------------------------
+
+    @unittest.skipUnless(h.HAVE_PMTILES, "needs go-pmtiles (pmtiles)")
+    def test_pmtiles_archive_matches_mbtiles(self):
+        pm = self.out.with_suffix(".pmtiles")
+        self.assertTrue(pm.exists(), "no mini.pmtiles beside mini.mbtiles")
+        self.assertIn("PMTiles ->", self.first.stdout)
+        a, b = h.decode_all(self.out), h.decode_all(pm)
+        self.assertEqual(set(a["tiles"]), set(b["tiles"]), "tile sets differ")
+        self.assertGreater(len(a["tiles"]), 0)
+        for key, digest in a["tiles"].items():
+            self.assertEqual(digest, b["tiles"][key], f"tile {key} differs")
+        ma, mb = a["metadata"], b["metadata"]
+        self.assertEqual(mb.get("type"), "S-57")
+        for k in ("name", "description", "format", "minzoom", "maxzoom",
+                  "bounds"):
+            self.assertEqual(ma.get(k), mb.get(k), k)
+        # go-pmtiles re-serialises the `json` row (key order changes);
+        # the layer list must survive intact.
+        self.assertEqual(json.loads(ma["json"])["vector_layers"],
+                         json.loads(mb["json"])["vector_layers"])
 
     # -- resume ------------------------------------------------------------
 

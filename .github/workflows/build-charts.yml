@@ -54,10 +54,12 @@ jobs:
               b = builds[name]
               # Output name derived from first source: 01CGD_ENCs.zip -> 01CGD_ENCs.mbtiles
               first_source = b["sources"][0]
-              output = first_source.rsplit(".", 1)[0] + ".mbtiles"
+              stem = first_source.rsplit(".", 1)[0]
+              output = stem + ".mbtiles"
               matrix.append({
                   "name": name,
                   "output": output,
+                  "pmtiles": stem + ".pmtiles",
                   "mode": b.get("mode", "by-band"),
                   "sources": [f"{base_url}/{s}" for s in b["sources"]],
                   "source_filenames": b["sources"],
@@ -98,11 +100,22 @@ jobs:
         run: |
           sudo apt-get install -y -qq gdal-bin
 
+      - name: Install go-pmtiles (writes the .pmtiles copy)
+        env:
+          # Pinned like tippecanoe; bump deliberately.
+          PMTILES_VERSION: "1.31.2"
+        run: |
+          curl -fsSL "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C /tmp pmtiles
+          sudo install -m 755 /tmp/pmtiles /usr/local/bin/pmtiles
+          pmtiles version
+
       - name: Verify tools
         run: |
           tippecanoe --version
           which tile-join
           ogr2ogr --version
+          pmtiles version
 
       - name: Download ENC sources
         run: |
@@ -134,11 +147,12 @@ jobs:
           python3 s57-to-mbtiles.py $inputs \
             $mode_flags \
             -o "${{ matrix.build.output }}" \
+            --pmtiles \
             -j 2
 
       - name: Show result
         run: |
-          ls -lh "data/tiles/${{ matrix.build.output }}"
+          ls -lh "data/tiles/${{ matrix.build.output }}" "data/tiles/${{ matrix.build.pmtiles }}"
 
       - name: Generate metadata
         shell: python3 {0}
@@ -146,6 +160,7 @@ jobs:
           import json, sqlite3, os
 
           mbtiles = "data/tiles/${{ matrix.build.output }}"
+          pmtiles = "data/tiles/${{ matrix.build.pmtiles }}"
           name = os.path.splitext("${{ matrix.build.output }}")[0]
 
           db = sqlite3.connect(mbtiles)
@@ -175,6 +190,8 @@ jobs:
               "enc_sources": [f"https://charts.noaa.gov/ENCs/{s}" for s in sources],
               "build_date": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
               "file_size_mb": round(os.path.getsize(mbtiles) / 1048576, 1),
+              # Same tiles and metadata as the .mbtiles, as a PMTiles archive.
+              "pmtiles_file_size_mb": round(os.path.getsize(pmtiles) / 1048576, 1),
           }
 
           out = f"data/tiles/{name}.json"
@@ -189,6 +206,7 @@ jobs:
           name: ${{ matrix.build.name }}
           path: |
             data/tiles/${{ matrix.build.output }}
+            data/tiles/${{ matrix.build.pmtiles }}
             data/tiles/*.json
           retention-days: 7
 
@@ -215,7 +233,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.pmtiles" -o -name "*.json" \) -type f | sort)
           if [ -z "$files" ]; then
             echo "No successful builds produced artifacts — nothing to release."
             exit 1
@@ -280,7 +298,7 @@ jobs:
           BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           BUCKET="${BUCKET%/}"  # tolerate a trailing slash in the secret
-          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.pmtiles" -o -name "*.json" \) -type f | sort)
           failed=""
           for f in $files; do
             name=$(basename "$f")
@@ -334,7 +352,7 @@ jobs:
             echo "### All charts on R2 (no size limit)"
             echo
             aws s3 ls --endpoint-url "$ENDPOINT" "s3://$BUCKET/charts/" \
-              | awk '$4 ~ /\.mbtiles$/ {print $3, $4}' | sort -k2 \
+              | awk '$4 ~ /\.(mbtiles|pmtiles)$/ {print $3, $4}' | sort -k2 \
               | while read -r size name; do
                   note=""
                   if [ "$size" -ge "$MAX_ASSET_SIZE" ]; then
@@ -343,7 +361,7 @@ jobs:
                   echo "- [$name]($PUB/charts/$name) ($(numfmt --to=iec "$size")B)$note"
                 done
             echo
-            echo "Per-chart metadata: same URLs with \`.json\` instead of \`.mbtiles\`."
+            echo "Each district is published twice with identical tiles: \`.mbtiles\` (SQLite) and \`.pmtiles\` (single-file archive for HTTP range requests). Per-chart metadata: same URLs with \`.json\`."
           } > notes.md
 
           cat notes.md
