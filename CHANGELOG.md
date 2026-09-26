@@ -8,6 +8,14 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- CI test pathway: `workflow_dispatch` gained a `publish` input that
+  defaults to `test`. A test run builds normally but the `release` job is
+  skipped; a `test-stage` job mirrors the outputs to R2
+  `charts-test/<branch>/` and lists them in the run summary, so new code
+  can be built end to end without overwriting the published charts.
+  `release` publishes as before and is refused from any branch but the
+  default one; scheduled runs still publish. `verify-r2-charts.py
+  --prefix charts-test/<branch>` measures a staged test build.
 - `scale` metadata row in every output (and `scale` in the release JSON):
   the most detailed compilation scale among the bundle's live cells, DSPM
   CSCL read from the DSID layer the cancellation check already reads

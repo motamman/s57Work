@@ -37,7 +37,8 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-R2_BASE = "https://pub-281728c6a69f4f549cf0ec4e83f9fcde.r2.dev/US-ENC/charts"
+R2_ROOT = "https://pub-281728c6a69f4f549cf0ec4e83f9fcde.r2.dev/US-ENC"
+R2_BASE = f"{R2_ROOT}/charts"  # overridden by --prefix (e.g. charts-test/<branch>)
 
 # district -> [(name, lon, lat)]
 PROBES = {
@@ -195,7 +196,12 @@ def main():
                          "~/.cache/verify-r2-charts, created owner-only)")
     ap.add_argument("--report", type=Path, default=Path("verify-report.md"))
     ap.add_argument("--keep", action="store_true", help="do not delete downloaded files")
+    ap.add_argument("--prefix", default="charts",
+                    help="R2 folder to read, e.g. charts-test/<branch> for a "
+                         "workflow test run (default: charts, the published files)")
     args = ap.parse_args()
+    global R2_BASE
+    R2_BASE = f"{R2_ROOT}/{args.prefix.strip('/')}"
 
     if not args.scratch.exists():
         # Download paths are predictable, so a fresh scratch dir is

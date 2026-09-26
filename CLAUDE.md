@@ -58,7 +58,7 @@ All artifacts stored in `./data/` and preserved between runs for resume capabili
 
 - `enc-sources.yaml` — defines all available builds (CG districts and individual states) with an `active` list controlling which run
 - `.github/workflows/build-charts.yml` — downloads ENC ZIPs from NOAA, runs the pipeline, uploads `.mbtiles` as GitHub Release assets
-- Manual trigger supports overriding the active build list and reusing cached GeoJSON
+- Manual trigger supports overriding the active build list. **Test pathway**: the `publish` input defaults to `test`, which builds everything but leaves the `latest` release and R2 `charts/` untouched; outputs go to run artifacts (7 days) and R2 `charts-test/<branch>/` (job `test-stage`), and `verify-r2-charts.py --prefix charts-test/<branch>` reads them. `release` publishes and is refused off the default branch. Scheduled runs always publish
 
 ## Repo Structure
 
