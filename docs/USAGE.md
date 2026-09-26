@@ -256,7 +256,7 @@ To force a full rebuild, delete `data/` (or just `data/tiles/` to redo only the 
 
 ## Output
 
-The final `.mbtiles` file is a standard MBTiles v1.3 vector tileset, written to `data/tiles/<name>.mbtiles` and copied to `--output-dir` if given. Metadata is patched to set `type=S-57` and `name`/`description` to the output stem. In by-band mode the declared bounds reflect the district region, not the full extent of its overview cells.
+The final `.mbtiles` file is a standard MBTiles v1.3 vector tileset, written to `data/tiles/<name>.mbtiles` and copied to `--output-dir` if given. Metadata is patched to set `type=S-57`, `name`/`description` to the output stem, and `scale` to the most detailed compilation scale among the bundle's cells (DSPM CSCL, e.g. `22000` for 1:22,000; the finest band's nominal scale if none is readable). Signal K chart plugins read that row and default to 250000 without it; Freeboard-SK uses it to stack charts most-detailed-on-top. In by-band mode the declared bounds reflect the district region, not the full extent of its overview cells.
 
 ### PMTiles copy (`--pmtiles`)
 

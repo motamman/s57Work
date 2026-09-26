@@ -185,6 +185,9 @@ jobs:
               "center": center[:2] if len(center) >= 2 else None,
               "minzoom": int(meta.get("minzoom", 0)),
               "maxzoom": int(meta.get("maxzoom", 0)),
+              # Most detailed compilation scale in the bundle (denominator);
+              # chart plugins read the same row from the MBTiles metadata.
+              "scale": int(meta["scale"]) if meta.get("scale") else None,
               "format": "pbf",
               "layers": layers,
               "enc_sources": [f"https://charts.noaa.gov/ENCs/{s}" for s in sources],

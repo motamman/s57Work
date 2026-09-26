@@ -610,16 +610,29 @@ def _cell_files(enc: Path) -> List[Path]:
     return sorted(enc.parent.glob(f"{enc.stem}.[0-9][0-9][0-9]"))
 
 
+# DSID fields the pipeline reads per cell: edition/update/issue date for
+# cancellation and freshness (DSID record) and the compilation scale
+# (DSPM record, exposed by GDAL on the same DSID layer) for the bundle's
+# `scale` metadata.
+DSID_FIELDS = {"EDTN": "DSID_EDTN", "UPDN": "DSID_UPDN", "ISDT": "DSID_ISDT",
+               "CSCL": "DSPM_CSCL"}
+
+
+def parse_dsid(text: str) -> Dict[str, Optional[str]]:
+    """DSID_FIELDS values out of `ogrinfo -al` output of the DSID layer;
+    None for a field that is absent."""
+    out: Dict[str, Optional[str]] = {}
+    for key, field in DSID_FIELDS.items():
+        m = re.search(rf"{field} \(\w+\) = (\S+)", text)
+        out[key] = m.group(1) if m else None
+    return out
+
+
 def read_cell_dsid(enc: Path, gdal: "GdalRunner") -> Dict[str, Optional[str]]:
-    """EDTN/UPDN/ISDT from the DSID record with updates applied."""
+    """EDTN/UPDN/ISDT/CSCL from the DSID record with updates applied."""
     res = subprocess.run(gdal.cmd(["ogrinfo", "-ro", "-q", "-al", enc, "DSID"]),
                          capture_output=True, text=True)
-    out: Dict[str, Optional[str]] = {"EDTN": None, "UPDN": None, "ISDT": None}
-    for key in out:
-        m = re.search(rf"DSID_{key} \(\w+\) = (\S+)", res.stdout)
-        if m:
-            out[key] = m.group(1)
-    return out
+    return parse_dsid(res.stdout)
 
 
 def read_cell_versions(enc_files: List[Path], data_dir: Path,
@@ -643,8 +656,12 @@ def read_cell_versions(enc_files: List[Path], data_dir: Path,
         """Cache key: the cell name, shared by every staged copy."""
         return enc.stem.upper()
 
+    # A cache entry is reused only for the same file state and only if it
+    # carries every field read today (entries written before CSCL was
+    # added lack it).
     todo = [e for e in enc_files
-            if cache.get(key(e), {}).get("stamp") != stamp(e)]
+            if cache.get(key(e), {}).get("stamp") != stamp(e)
+            or any(f not in cache.get(key(e), {}) for f in DSID_FIELDS)]
     if todo:
         print(f"Reading DSID of {len(todo)}/{len(enc_files)} cell(s)"
               f"{' for ' + why if why else ''}...")
@@ -669,6 +686,44 @@ def cell_version(info: Dict[str, Optional[str]]) -> str:
     if not info.get("EDTN"):
         return "unknown"
     return f"{info['EDTN']}.{info.get('UPDN') or 0}"
+
+
+# Nominal compilation scale per usage band, the fallback for a bundle's
+# `scale` when no cell's DSPM CSCL could be read (NOAA's band definitions;
+# the same figures BAND_ZOOM quotes).
+BAND_NOMINAL_SCALE: Dict[int, int] = {
+    1: 3_500_000, 2: 700_000, 3: 90_000, 4: 22_000, 5: 8_000, 6: 3_000}
+
+
+def bundle_scale(enc_files: List[Path], data_dir: Path, gdal: "GdalRunner",
+                 max_workers: int) -> Optional[int]:
+    """The `scale` metadata of a bundle built from enc_files: the most
+    detailed compilation scale among its cells (smallest DSPM CSCL), or
+    the finest band's nominal scale when no CSCL is readable, or None
+    for an empty inventory.
+
+    A bundle merges many cells across bands, so it has no single true
+    scale; the consumers of this value (Signal K chart plugins, which
+    default to 250000 when the row is missing, and Freeboard-SK, which
+    only uses it to stack charts most-detailed-on-top) need the scale of
+    the most detailed data the bundle holds. Reads nothing new: the DSID
+    fields are already cached per cell for the cancellation check."""
+    if not enc_files:
+        return None
+    versions = read_cell_versions(enc_files, data_dir, gdal, max_workers,
+                                  "compilation scale")
+    scales = []
+    for e in enc_files:
+        try:
+            cscl = int(versions[e].get("CSCL") or 0)
+        except (TypeError, ValueError):
+            cscl = 0
+        if cscl > 0:
+            scales.append(cscl)
+    if scales:
+        return min(scales)
+    bands = [b for b in (enc_band(e) for e in enc_files) if b in BAND_NOMINAL_SCALE]
+    return BAND_NOMINAL_SCALE[max(bands)] if bands else None
 
 
 def drop_cancelled_cells(enc_files: List[Path], data_dir: Path,
@@ -1819,10 +1874,13 @@ def erase_for_run(run: RenderRun, data_dir: Path, gdal: GdalRunner,
 
 
 def _patch_metadata(mbtiles_path: Path, name: str,
-                    drop_rate: Optional[float] = None):
+                    drop_rate: Optional[float] = None,
+                    scale: Optional[int] = None):
     """Stamp type/name/description and, when given, the `drop_rate` the
     file was rendered with (read back by _mbtiles_drop_rate for the
-    freshness check in run_tippecanoe_for_source)."""
+    freshness check in run_tippecanoe_for_source) and the bundle's
+    `scale` (bundle_scale; Signal K chart plugins read this row and
+    default to 250000 without it)."""
     db = sqlite3.connect(str(mbtiles_path))
     db.execute("CREATE TABLE IF NOT EXISTS metadata (name text, value text)")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS name ON metadata (name)")
@@ -1835,6 +1893,9 @@ def _patch_metadata(mbtiles_path: Path, name: str,
     if drop_rate is not None:
         db.execute("INSERT OR REPLACE INTO metadata (name, value) "
                    "VALUES ('drop_rate', ?)", (repr(float(drop_rate)),))
+    if scale is not None:
+        db.execute("INSERT OR REPLACE INTO metadata (name, value) "
+                   "VALUES ('scale', ?)", (str(int(scale)),))
     db.commit()
     db.close()
 
@@ -2030,7 +2091,8 @@ def trim_low_bands_to_region(tiles: List[Tuple[float, Path]]
 # Stage 5: tile-join merge
 # ---------------------------------------------------------------------------
 
-def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
+def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str,
+                  scale: Optional[int] = None):
     print(f"\nMerging {len(tile_files)} tile set(s) with tile-join...")
     cmd = [
         "tile-join",
@@ -2043,7 +2105,7 @@ def merge_mbtiles(tile_files: List[Path], output_path: Path, final_name: str):
     if result.returncode != 0:
         print("ERROR: tile-join failed", file=sys.stderr)
         sys.exit(1)
-    _patch_metadata(output_path, final_name)
+    _patch_metadata(output_path, final_name, scale=scale)
     print(f"Merged -> {output_path} ({output_path.stat().st_size / 1048576:.1f} MB)")
 
 
@@ -2703,11 +2765,12 @@ def process_by_band(
     max_workers: int,
     replacements: bool = True,
     catalog_path: Optional[Path] = None,
-) -> List[Path]:
+) -> Tuple[List[Path], Optional[int]]:
     """The by-band pipeline: stage inputs, drop cancelled cells and fetch
     their replacements, export per band, resolve same-band overlaps,
     consolidate, erase finer coverage, tile each render run, clip bands
-    1-2 to the district region. Returns the tilesets for tile-join."""
+    1-2 to the district region. Returns the tilesets for tile-join and
+    the bundle's scale (bundle_scale; None when unknown)."""
     print("\n-- By-band mode ---------------------------------------------------")
 
     # Stage 1: stage all inputs
@@ -2735,6 +2798,13 @@ def process_by_band(
         all_enc = all_enc + fetch_replacement_cells(
             cancelled, all_enc, data_dir, gdal_probe, catalog_path,
             data_dir / "replacement-cells.json")
+
+    # The bundle's `scale` metadata: most detailed compilation scale of
+    # the live inventory (bundle_scale). Cached DSID reads, so free here.
+    # (Named cscl: `scale` below is each band's display string.)
+    cscl = bundle_scale(all_enc, data_dir, gdal_probe, max_workers)
+    if cscl:
+        print(f"Bundle scale (finest cell compilation scale): 1:{cscl:,}")
 
     by_band = group_by_band(all_enc)
 
@@ -2895,7 +2965,7 @@ def process_by_band(
     # Coarse → fine for tile-join. The erase already made the tilesets
     # disjoint wherever they share a zoom, so the order is cosmetic.
     tiles.sort(key=lambda t: (t[0], t[1].name))
-    return [p for _, p in tiles]
+    return [p for _, p in tiles], cscl
 
 
 # ---------------------------------------------------------------------------
@@ -2909,11 +2979,13 @@ def process_source(
     native_gdal: bool,
     runtime: Optional[str],
     max_workers: int,
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], Optional[int]]:
     """Plain (per-input) pipeline for one source: extract, export,
-    consolidate, tile over the source's zoom range. Returns the tileset
-    or None when the source has nothing to render."""
+    consolidate, tile over the source's zoom range. Returns (tileset or
+    None when the source has nothing to render, bundle scale or None for
+    a GeoJSON-dir source with no cells to read it from)."""
     label = source.label or f"source{idx}"
+    scale: Optional[int] = None
     safe_label = re.sub(r'[^\w\-.]', '_', label)
 
     enc_dir = data_dir / "enc" / safe_label
@@ -2940,6 +3012,9 @@ def process_source(
             print(f"ERROR: No .000 files in {source.path}", file=sys.stderr)
             sys.exit(1)
         print(f"Found {len(enc_files)} ENC file(s)")
+        scale = bundle_scale(enc_files, data_dir,
+                             GdalRunner(native_gdal, runtime, data_dir),
+                             max_workers)
         # Cells cancelled or removed since the last run must not linger.
         _remove_orphan_cells(geojson_dir, {e.stem.upper() for e in enc_files})
         export_to_geojson(
@@ -2953,9 +3028,10 @@ def process_source(
     # Use merged dir if consolidation produced files, else raw geojson
     input_dir = merged_dir if consolidated else geojson_dir
 
-    return run_tippecanoe_for_source(
+    mbtiles = run_tippecanoe_for_source(
         input_dir, tile_dir, f"s{idx}",
         source.minzoom, source.maxzoom, max_workers=max_workers)
+    return mbtiles, scale
 
 
 # ---------------------------------------------------------------------------
@@ -2994,7 +3070,7 @@ def main():
                 sys.exit(1)
 
         # process_by_band returns one .mbtiles per band, ordered coarse → fine
-        tile_files = process_by_band(
+        tile_files, scale = process_by_band(
             input_paths, data_dir, args.minzoom, args.maxzoom,
             native_gdal, runtime, args.jobs,
             replacements=not args.no_replacements,
@@ -3002,9 +3078,9 @@ def main():
 
         if len(tile_files) == 1:
             shutil.copy2(tile_files[0], tiles_path)
-            _patch_metadata(tiles_path, tiles_path.stem)
+            _patch_metadata(tiles_path, tiles_path.stem, scale=scale)
         else:
-            merge_mbtiles(tile_files, tiles_path, tiles_path.stem)
+            merge_mbtiles(tile_files, tiles_path, tiles_path.stem, scale=scale)
 
         print(f"\nSummary (by-band):")
         print(f"  Inputs: {', '.join(p.name for p in input_paths)}")
@@ -3018,12 +3094,16 @@ def main():
 
         # Pair each source's mbtiles with its minzoom for coarse→fine sort
         source_tiles: List[Tuple[int, Path]] = []
+        scales: List[int] = []
         for i, source in enumerate(sources):
-            result = process_source(
+            result, src_scale = process_source(
                 source, data_dir, i + 1,
                 native_gdal, runtime, args.jobs)
             if result is not None:
                 source_tiles.append((source.minzoom, result))
+            if src_scale:
+                scales.append(src_scale)
+        scale = min(scales) if scales else None
 
         if not source_tiles:
             print("ERROR: No tiles produced", file=sys.stderr)
@@ -3034,16 +3114,17 @@ def main():
 
         if len(tile_files) == 1:
             shutil.copy2(tile_files[0], tiles_path)
-            _patch_metadata(tiles_path, tiles_path.stem)
+            _patch_metadata(tiles_path, tiles_path.stem, scale=scale)
         else:
-            merge_mbtiles(tile_files, tiles_path, tiles_path.stem)
+            merge_mbtiles(tile_files, tiles_path, tiles_path.stem, scale=scale)
 
         print(f"\nSummary:")
         for i, s in enumerate(sources):
             print(f"  Source {i+1}: {s.label}  z{s.minzoom}-{s.maxzoom}")
 
     size_mb = tiles_path.stat().st_size / 1048576
-    print(f"  Tiles: {tiles_path} ({size_mb:.1f} MB)")
+    print(f"  Tiles: {tiles_path} ({size_mb:.1f} MB)"
+          + (f", scale 1:{scale:,}" if scale else ", scale unknown"))
     pmtiles_path = write_pmtiles(tiles_path) if args.pmtiles else None
     if prod_path:
         shutil.copy2(tiles_path, prod_path)

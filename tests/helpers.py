@@ -42,6 +42,14 @@ def counter():
 HAVE_GDAL = bool(shutil.which("ogr2ogr") and shutil.which("ogrinfo"))
 HAVE_TIPPECANOE = bool(shutil.which("tippecanoe") and shutil.which("tile-join")
                        and shutil.which("tippecanoe-decode"))
+HAVE_PMTILES = bool(shutil.which("pmtiles"))
+
+
+def pmtiles_metadata(archive: Path) -> dict:
+    """The metadata JSON of a PMTiles archive via `pmtiles show`."""
+    out = subprocess.run(["pmtiles", "show", str(archive), "--metadata"],
+                         capture_output=True, text=True)
+    return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
 HAVE_PMTILES = bool(shutil.which("pmtiles"))  # go-pmtiles, for --pmtiles
 
 

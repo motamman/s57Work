@@ -8,6 +8,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `scale` metadata row in every output (and `scale` in the release JSON):
+  the most detailed compilation scale among the bundle's live cells, DSPM
+  CSCL read from the DSID layer the cancellation check already reads
+  (`parse_dsid`, `bundle_scale`), with the finest band's nominal scale as
+  fallback. Signal K chart plugins read this row and defaulted to 250000
+  for every district file, so Freeboard-SK stacked them all as equals.
 - `--pmtiles`: also write the final tileset as a PMTiles archive beside
   the `.mbtiles`, via go-pmtiles' `pmtiles convert` run after the
   metadata patch so `type=S-57`, `name`, bounds and `vector_layers`

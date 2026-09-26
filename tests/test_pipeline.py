@@ -41,7 +41,7 @@ class ByBandPipeline(unittest.TestCase):
         cls.zip = cls.work / "MINI_ENCs.zip"
         shutil.copy(h.FIXTURE_ZIP, cls.zip)
         cls.args = (str(cls.zip), "--by-band", "--no-replacements", "-j", "2",
-                    "-o", "mini.mbtiles")
+                    "-o", "mini.mbtiles") + (("--pmtiles",) if h.HAVE_PMTILES else ())
         if h.HAVE_PMTILES:
             cls.args += ("--pmtiles",)
         cls.first = h.run_pipeline(cls.work, *cls.args)
@@ -71,6 +71,21 @@ class ByBandPipeline(unittest.TestCase):
         meta = h.metadata(self.out)
         self.assertEqual((meta["minzoom"], meta["maxzoom"]), ("13", "16"))
         self.assertEqual(meta["type"], "S-57")
+
+    def test_scale_is_the_finest_cell_compilation_scale(self):
+        # US4NY1BY 1:45,000; US5RI1AC/AD/AE 1:22,000; the cancelled
+        # US5NJ30M (1:40,000) is not in the inventory.
+        self.assertEqual(h.metadata(self.out)["scale"], "22000")
+        self.assertIn("Bundle scale (finest cell compilation scale): 1:22,000",
+                      self.first.stdout)
+
+    @unittest.skipUnless(h.HAVE_PMTILES, "needs go-pmtiles")
+    def test_pmtiles_copy_carries_the_same_metadata(self):
+        arch = self.out.with_suffix(".pmtiles")
+        self.assertTrue(arch.exists())
+        meta = h.pmtiles_metadata(arch)
+        self.assertEqual(str(meta.get("scale")), "22000")
+        self.assertEqual(meta.get("type"), "S-57")
 
     def test_render_plan_erases_band4_under_band5(self):
         self.assertIn("band4-approach_z15-16.minus-band5-harbour", self.first.stdout)
