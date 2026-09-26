@@ -201,7 +201,8 @@ def main():
                          "workflow test run (default: charts, the published files)")
     args = ap.parse_args()
     global R2_BASE
-    R2_BASE = f"{R2_ROOT}/{args.prefix.strip('/')}"
+    prefix = args.prefix.strip("/")
+    R2_BASE = f"{R2_ROOT}/{prefix}"
 
     if not args.scratch.exists():
         # Download paths are predictable, so a fresh scratch dir is
@@ -211,7 +212,10 @@ def main():
     with open(args.report, "a") as out:
         out.write(f"\n# Chart verification {time.strftime('%Y-%m-%d %H:%M')}\n")
         for d in args.districts:
-            path = args.scratch / f"{d}_ENCs.mbtiles"
+            # Keyed by prefix: downloads resume with `curl -C -`, and a
+            # partial file from another prefix must never be continued.
+            path = args.scratch / prefix / f"{d}_ENCs.mbtiles"
+            path.parent.mkdir(parents=True, exist_ok=True)
             print(f"[{d}] downloading...", flush=True)
             try:
                 secs = download(d, path)

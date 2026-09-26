@@ -50,7 +50,6 @@ def pmtiles_metadata(archive: Path) -> dict:
     out = subprocess.run(["pmtiles", "show", str(archive), "--metadata"],
                          capture_output=True, text=True)
     return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
-HAVE_PMTILES = bool(shutil.which("pmtiles"))  # go-pmtiles, for --pmtiles
 
 
 def decode_all(tileset: Path) -> dict:

@@ -41,7 +41,7 @@ class ByBandPipeline(unittest.TestCase):
         cls.zip = cls.work / "MINI_ENCs.zip"
         shutil.copy(h.FIXTURE_ZIP, cls.zip)
         cls.args = (str(cls.zip), "--by-band", "--no-replacements", "-j", "2",
-                    "-o", "mini.mbtiles") + (("--pmtiles",) if h.HAVE_PMTILES else ())
+                    "-o", "mini.mbtiles")
         if h.HAVE_PMTILES:
             cls.args += ("--pmtiles",)
         cls.first = h.run_pipeline(cls.work, *cls.args)
