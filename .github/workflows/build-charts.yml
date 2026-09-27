@@ -8,6 +8,17 @@ on:
         description: 'Comma-separated build names (leave empty to use active list from enc-sources.yaml)'
         required: false
         default: ''
+      publish:
+        description: >-
+          test: build only; outputs go to run artifacts and R2 charts-test/<branch>/,
+          the 'latest' release and R2 charts/ are untouched.
+          release: publish to the 'latest' release and R2 charts/ (default branch only).
+        type: choice
+        required: true
+        default: test
+        options:
+          - test
+          - release
 
   # Monthly rebuild on the 1st at 2am UTC (sailing season: Apr-Nov)
   schedule:
@@ -24,8 +35,37 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.parse.outputs.matrix }}
+      publish: ${{ steps.mode.outputs.publish }}
     steps:
       - uses: actions/checkout@v7
+
+      # Test pathway: a manual run publishes only when 'release' is chosen,
+      # and only from the default branch, so trying new code on a branch
+      # can never overwrite the published charts. Scheduled runs publish.
+      - name: Decide whether this run publishes
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          CHOICE: ${{ github.event.inputs.publish }}
+          REF: ${{ github.ref_name }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          publish=false
+          if [ "$EVENT" = "schedule" ]; then
+            publish=true
+          elif [ "$CHOICE" = "release" ]; then
+            if [ "$REF" != "$DEFAULT" ]; then
+              echo "::error::'release' is only allowed from $DEFAULT (this run is on $REF). Merge first, or run as 'test'."
+              exit 1
+            fi
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          if [ "$publish" = true ]; then
+            echo "This run PUBLISHES to the 'latest' release and R2 charts/." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "TEST run: outputs go to run artifacts and R2 charts-test/ only; nothing published is touched." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Parse enc-sources.yaml
         id: parse
@@ -54,10 +94,12 @@ jobs:
               b = builds[name]
               # Output name derived from first source: 01CGD_ENCs.zip -> 01CGD_ENCs.mbtiles
               first_source = b["sources"][0]
-              output = first_source.rsplit(".", 1)[0] + ".mbtiles"
+              stem = first_source.rsplit(".", 1)[0]
+              output = stem + ".mbtiles"
               matrix.append({
                   "name": name,
                   "output": output,
+                  "pmtiles": stem + ".pmtiles",
                   "mode": b.get("mode", "by-band"),
                   "sources": [f"{base_url}/{s}" for s in b["sources"]],
                   "source_filenames": b["sources"],
@@ -98,11 +140,22 @@ jobs:
         run: |
           sudo apt-get install -y -qq gdal-bin
 
+      - name: Install go-pmtiles (writes the .pmtiles copy)
+        env:
+          # Pinned like tippecanoe; bump deliberately.
+          PMTILES_VERSION: "1.31.2"
+        run: |
+          curl -fsSL "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C /tmp pmtiles
+          sudo install -m 755 /tmp/pmtiles /usr/local/bin/pmtiles
+          pmtiles version
+
       - name: Verify tools
         run: |
           tippecanoe --version
           which tile-join
           ogr2ogr --version
+          pmtiles version
 
       - name: Download ENC sources
         run: |
@@ -134,11 +187,12 @@ jobs:
           python3 s57-to-mbtiles.py $inputs \
             $mode_flags \
             -o "${{ matrix.build.output }}" \
+            --pmtiles \
             -j 2
 
       - name: Show result
         run: |
-          ls -lh "data/tiles/${{ matrix.build.output }}"
+          ls -lh "data/tiles/${{ matrix.build.output }}" "data/tiles/${{ matrix.build.pmtiles }}"
 
       - name: Generate metadata
         shell: python3 {0}
@@ -146,6 +200,7 @@ jobs:
           import json, sqlite3, os
 
           mbtiles = "data/tiles/${{ matrix.build.output }}"
+          pmtiles = "data/tiles/${{ matrix.build.pmtiles }}"
           name = os.path.splitext("${{ matrix.build.output }}")[0]
 
           db = sqlite3.connect(mbtiles)
@@ -170,11 +225,16 @@ jobs:
               "center": center[:2] if len(center) >= 2 else None,
               "minzoom": int(meta.get("minzoom", 0)),
               "maxzoom": int(meta.get("maxzoom", 0)),
+              # Most detailed compilation scale in the bundle (denominator);
+              # chart plugins read the same row from the MBTiles metadata.
+              "scale": int(meta["scale"]) if meta.get("scale") else None,
               "format": "pbf",
               "layers": layers,
               "enc_sources": [f"https://charts.noaa.gov/ENCs/{s}" for s in sources],
               "build_date": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
               "file_size_mb": round(os.path.getsize(mbtiles) / 1048576, 1),
+              # Same tiles and metadata as the .mbtiles, as a PMTiles archive.
+              "pmtiles_file_size_mb": round(os.path.getsize(pmtiles) / 1048576, 1),
           }
 
           out = f"data/tiles/{name}.json"
@@ -189,15 +249,17 @@ jobs:
           name: ${{ matrix.build.name }}
           path: |
             data/tiles/${{ matrix.build.output }}
+            data/tiles/${{ matrix.build.pmtiles }}
             data/tiles/*.json
           retention-days: 7
 
   # ── Step 3: Create release, archive previous, prune old ─────────────
   release:
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     # Run even if some matrix builds failed — release whatever succeeded.
-    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    # Never on a test run (see the prepare job).
+    if: ${{ !cancelled() && needs.build.result != 'skipped' && needs.prepare.outputs.publish == 'true' }}
     permissions:
       contents: write
     env:
@@ -215,7 +277,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.pmtiles" -o -name "*.json" \) -type f | sort)
           if [ -z "$files" ]; then
             echo "No successful builds produced artifacts — nothing to release."
             exit 1
@@ -280,7 +342,7 @@ jobs:
           BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           BUCKET="${BUCKET%/}"  # tolerate a trailing slash in the secret
-          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.json" \) -type f | sort)
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.pmtiles" -o -name "*.json" \) -type f | sort)
           failed=""
           for f in $files; do
             name=$(basename "$f")
@@ -334,7 +396,7 @@ jobs:
             echo "### All charts on R2 (no size limit)"
             echo
             aws s3 ls --endpoint-url "$ENDPOINT" "s3://$BUCKET/charts/" \
-              | awk '$4 ~ /\.mbtiles$/ {print $3, $4}' | sort -k2 \
+              | awk '$4 ~ /\.(mbtiles|pmtiles)$/ {print $3, $4}' | sort -k2 \
               | while read -r size name; do
                   note=""
                   if [ "$size" -ge "$MAX_ASSET_SIZE" ]; then
@@ -343,8 +405,90 @@ jobs:
                   echo "- [$name]($PUB/charts/$name) ($(numfmt --to=iec "$size")B)$note"
                 done
             echo
-            echo "Per-chart metadata: same URLs with \`.json\` instead of \`.mbtiles\`."
+            echo "Each district is published twice with identical tiles: \`.mbtiles\` (SQLite) and \`.pmtiles\` (single-file archive for HTTP range requests). Per-chart metadata: same URLs with \`.json\`."
           } > notes.md
 
           cat notes.md
           gh release edit "latest" --notes-file notes.md
+
+  # ── Test pathway: stage outputs where they cannot collide ───────────
+  # Runs instead of `release` when the run does not publish. The built
+  # files stay as run artifacts (7 days) and are mirrored to R2 under
+  # charts-test/<branch>/ (the ref name verbatim) so they can be downloaded, decoded
+  # (count-layer-by-zoom.py, verify-r2-charts.py --prefix) or served on a
+  # test server. The 'latest' release and R2 charts/ are never touched.
+  # Test objects are overwritten per branch on each run and are not
+  # pruned automatically.
+  test-stage:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.build.result != 'skipped' && needs.prepare.outputs.publish != 'true' }}
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+
+      - name: List built files
+        run: |
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.pmtiles" -o -name "*.json" \) -type f | sort)
+          if [ -z "$files" ]; then
+            echo "No successful builds produced artifacts."
+            exit 1
+          fi
+          ls -lh $files
+          {
+            echo "### Test build outputs (not published)"
+            echo
+            echo "Run artifacts (7 days): see this run's Artifacts panel."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage to R2 charts-test/<branch>/
+        if: ${{ env.R2_ACCOUNT_ID != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET }}
+          REF: ${{ github.ref_name }}
+        run: |
+          BUCKET="${BUCKET%/}"
+          # The ref name is used verbatim: git already restricts branch
+          # names to URL-safe characters, and slashes are ordinary in R2
+          # object keys, so feature/a and feature-a stay distinct.
+          prefix="charts-test/$REF"
+          PUB="${R2_PUBLIC_URL%/}"
+          case "$BUCKET" in
+            */*) PUB="$PUB/${BUCKET#*/}" ;;
+          esac
+          files=$(find artifacts/ \( -name "*.mbtiles" -o -name "*.pmtiles" -o -name "*.json" \) -type f | sort)
+          failed=""
+          echo "R2 test prefix: s3://$BUCKET/$prefix/" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          for f in $files; do
+            name=$(basename "$f")
+            echo "R2: staging $name ($(numfmt --to=iec $(stat -c%s "$f")))..."
+            if aws s3 cp --endpoint-url "$ENDPOINT" --no-progress \
+                "$f" "s3://$BUCKET/$prefix/$name"; then
+              if [ -n "$PUB" ]; then
+                echo "- [$name]($PUB/$prefix/$name)" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "- $name" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "::warning::R2 staging failed for $name"
+              failed="$failed $name"
+            fi
+          done
+          if [ -n "$failed" ]; then
+            echo "Failed R2 staging:$failed"
+            exit 1
+          fi
+

@@ -12,6 +12,8 @@ Takes one or more ZIP archives of S-57 ENC files from NOAA and runs a five-stage
 4. **tippecanoe** builds vector tiles per zoom level
 5. **tile-join** merges everything into a single `.mbtiles` file
 
+With `--pmtiles` the same tileset is also written as a single-file `.pmtiles` archive (identical tiles and metadata; needs [go-pmtiles](https://github.com/protomaps/go-pmtiles)). The CI build publishes both.
+
 The output can be served directly by [signalk-charts-provider-simple](https://github.com/SignalK/signalk-charts-provider-simple) and rendered by Freeboard-SK's S-57 style engine.
 
 ## Quick start
@@ -20,6 +22,7 @@ The output can be served directly by [signalk-charts-provider-simple](https://gi
 
 - Python 3 (standard library only)
 - [tippecanoe](https://github.com/felt/tippecanoe) (native install)
+- [go-pmtiles](https://github.com/protomaps/go-pmtiles) — optional, only for `--pmtiles`
 - GDAL (`ogr2ogr`) — native install or via Docker/Podman container
 
 See [docs/INSTALL.md](docs/INSTALL.md) for platform-specific setup (macOS, Raspberry Pi).

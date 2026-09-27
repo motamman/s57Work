@@ -101,6 +101,22 @@ class MbtilesMetadata(unittest.TestCase):
         self.assertEqual(meta["type"], "S-57")
         self.assertEqual(meta["name"], "t")
 
+    def test_scale_row_written_only_when_known(self):
+        p = Path(tempfile.mkdtemp()) / "t.mbtiles"
+        s57._patch_metadata(p, "t", scale=22000)
+        meta = dict(sqlite3.connect(str(p)).execute(
+            "SELECT name, value FROM metadata").fetchall())
+        self.assertEqual(meta["scale"], "22000")
+        s57._patch_metadata(p, "t")  # no scale given: existing row untouched
+        meta = dict(sqlite3.connect(str(p)).execute(
+            "SELECT name, value FROM metadata").fetchall())
+        self.assertEqual(meta["scale"], "22000")
+        q = p.with_name("u.mbtiles")
+        s57._patch_metadata(q, "u")
+        meta = dict(sqlite3.connect(str(q)).execute(
+            "SELECT name, value FROM metadata").fetchall())
+        self.assertNotIn("scale", meta)
+
     def test_file_without_drop_rate_is_never_fresh(self):
         p = Path(tempfile.mkdtemp()) / "t.mbtiles"
         s57._patch_metadata(p, "t")

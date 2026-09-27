@@ -42,6 +42,31 @@ def counter():
 HAVE_GDAL = bool(shutil.which("ogr2ogr") and shutil.which("ogrinfo"))
 HAVE_TIPPECANOE = bool(shutil.which("tippecanoe") and shutil.which("tile-join")
                        and shutil.which("tippecanoe-decode"))
+HAVE_PMTILES = bool(shutil.which("pmtiles"))
+
+
+def pmtiles_metadata(archive: Path) -> dict:
+    """The metadata JSON of a PMTiles archive via `pmtiles show`."""
+    out = subprocess.run(["pmtiles", "show", str(archive), "--metadata"],
+                         capture_output=True, text=True)
+    return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
+
+
+def decode_all(tileset: Path) -> dict:
+    """{(z, x, y): sha256 of the tile's decoded features} for every tile
+    plus the tileset's metadata, via a whole-file tippecanoe-decode. Works
+    on .mbtiles and .pmtiles alike, so the two can be compared."""
+    import hashlib
+    out = subprocess.run(["tippecanoe-decode", str(tileset)],
+                         capture_output=True, text=True, check=True)
+    fc = json.loads(out.stdout)
+    tiles = {}
+    for t in fc.get("features", []):
+        p = t["properties"]
+        digest = hashlib.sha256(
+            json.dumps(t.get("features", []), sort_keys=True).encode()).hexdigest()
+        tiles[(p["zoom"], p["x"], p["y"])] = digest
+    return {"tiles": tiles, "metadata": fc.get("properties", {})}
 
 
 def decode_tile(mbtiles: Path, z: int, x: int, y: int, layer=None) -> dict:

@@ -37,7 +37,8 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-R2_BASE = "https://pub-281728c6a69f4f549cf0ec4e83f9fcde.r2.dev/US-ENC/charts"
+R2_ROOT = "https://pub-281728c6a69f4f549cf0ec4e83f9fcde.r2.dev/US-ENC"
+R2_BASE = f"{R2_ROOT}/charts"  # overridden by --prefix (e.g. charts-test/<branch>)
 
 # district -> [(name, lon, lat)]
 PROBES = {
@@ -195,7 +196,13 @@ def main():
                          "~/.cache/verify-r2-charts, created owner-only)")
     ap.add_argument("--report", type=Path, default=Path("verify-report.md"))
     ap.add_argument("--keep", action="store_true", help="do not delete downloaded files")
+    ap.add_argument("--prefix", default="charts",
+                    help="R2 folder to read, e.g. charts-test/<branch> for a "
+                         "workflow test run (default: charts, the published files)")
     args = ap.parse_args()
+    global R2_BASE
+    prefix = args.prefix.strip("/")
+    R2_BASE = f"{R2_ROOT}/{prefix}"
 
     if not args.scratch.exists():
         # Download paths are predictable, so a fresh scratch dir is
@@ -205,7 +212,10 @@ def main():
     with open(args.report, "a") as out:
         out.write(f"\n# Chart verification {time.strftime('%Y-%m-%d %H:%M')}\n")
         for d in args.districts:
-            path = args.scratch / f"{d}_ENCs.mbtiles"
+            # Keyed by prefix: downloads resume with `curl -C -`, and a
+            # partial file from another prefix must never be continued.
+            path = args.scratch / prefix / f"{d}_ENCs.mbtiles"
+            path.parent.mkdir(parents=True, exist_ok=True)
             print(f"[{d}] downloading...", flush=True)
             try:
                 secs = download(d, path)

@@ -8,6 +8,33 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- CI test pathway: `workflow_dispatch` gained a `publish` input that
+  defaults to `test`. A test run builds normally but the `release` job is
+  skipped; a `test-stage` job mirrors the outputs to R2
+  `charts-test/<branch>/` and lists them in the run summary, so new code
+  can be built end to end without overwriting the published charts.
+  `release` publishes as before and is refused from any branch but the
+  default one; scheduled runs still publish. `verify-r2-charts.py
+  --prefix charts-test/<branch>` measures a staged test build.
+- `scale` metadata row in every output (and `scale` in the release JSON):
+  the most detailed compilation scale among the bundle's live cells, DSPM
+  CSCL read from the DSID layer the cancellation check already reads
+  (`parse_dsid`, `bundle_scale`), with the finest band's nominal scale as
+  fallback. Signal K chart plugins read this row and defaulted to 250000
+  for every district file, so Freeboard-SK stacked them all as equals.
+- `--pmtiles`: also write the final tileset as a PMTiles archive beside
+  the `.mbtiles`, via go-pmtiles' `pmtiles convert` run after the
+  metadata patch so `type=S-57`, `name`, bounds and `vector_layers`
+  carry over (tile-join's own PMTiles output resets the type to
+  `overlay`). Tiles are copied byte-for-byte and deduplicated; on a
+  district file the archive is smaller than the SQLite original. The
+  chart build workflow installs go-pmtiles 1.31.2, passes the flag, and
+  publishes `<district>.pmtiles` next to `<district>.mbtiles` in the
+  release and on R2; the per-chart `.json` gains `pmtiles_file_size_mb`.
+  Tests: `tests/test_pmtiles.py` (dependency check, conversion of a
+  tippecanoe-built tileset, failure leaves no partial file) and the
+  pipeline test decode `.mbtiles` and `.pmtiles` and require identical
+  tiles and metadata; both skip without the tool.
 - Test suite (`tests/`, standard-library `unittest`): 82 unit tests over
   cell/layer naming, the SOUNDG zoom rule and hash thinning, the
   finer-wins render plan, resume freshness, consolidation and overrides,
