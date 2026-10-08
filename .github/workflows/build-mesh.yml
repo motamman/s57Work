@@ -15,6 +15,13 @@ name: Build Navigation Meshes
 # the same test pathway as the charts (R2 charts-test/<branch>/).
 
 on:
+  # TEMPORARY, remove before merge: lets the branch test itself. A push
+  # runs the branch's own copy of this file, which GitHub will not
+  # dispatch until the file is on the default branch. Test mode only
+  # (outputs to charts-test/<branch>/), district 01cgd only.
+  push:
+    branches: [wrectched-news]
+
   workflow_run:
     workflows: ["Build ENC Charts"]
     types: [completed]
@@ -97,6 +104,7 @@ jobs:
         if: steps.mode.outputs.publish != 'skip'
         shell: python3 {0}
         env:
+          EVENT: ${{ github.event_name }}
           OVERRIDE: ${{ github.event.inputs.builds }}
           FORCE: ${{ github.event.inputs.force }}
           PUBLISH: ${{ steps.mode.outputs.publish }}
@@ -110,6 +118,8 @@ jobs:
               config = yaml.safe_load(f)
           mesh_cfg = config.get("mesh", {})
           override = os.environ["OVERRIDE"].strip()
+          if os.environ.get("EVENT") == "push":
+              override = "01cgd"          # TEMPORARY, remove with the push trigger above
           active = [b.strip() for b in override.split(",")] if override else mesh_cfg.get("active", [])
           runner = mesh_cfg.get("runner", "ubuntu-latest")
           workers = int(mesh_cfg.get("workers", 2))
