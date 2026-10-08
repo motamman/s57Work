@@ -136,8 +136,10 @@ jobs:
               pub = f"{pub}/{bucket.split('/', 1)[1]}"
 
           def fetch_json(url):
+              # Cloudflare answers 403 to urllib's default user agent.
+              req = urllib.request.Request(url, headers={"User-Agent": "s57Work-build-mesh"})
               try:
-                  with urllib.request.urlopen(url, timeout=60) as r:
+                  with urllib.request.urlopen(req, timeout=60) as r:
                       return json.load(r)
               except urllib.error.HTTPError as e:
                   if e.code == 404:
