@@ -118,8 +118,11 @@ to the sidecar. All of them gate except two:
 | 14 | the 3 × 3 block around the densest tile loads from the files alone | yes |
 | 9, 10, 11 | medial axis step, hazard columns, time measured | yes (always pass) |
 
-Plus: the finalize step's reverse-edge check gates. Exit 0 when all
-gating checks pass, 2 when one fails (files are left in place;
+Plus two more that gate: the finalize step's reverse-edge check, and
+"no z16 tile failed to decode" (a tile that does not decode drops its
+hazards, depth areas and land silently, and no later check can see
+that). Exit 0 when all gating checks pass, 2 when one fails (the
+outputs and the intermediates are left in place for diagnosis;
 `--allow-fail` makes it 0), 1 when the build itself fails.
 
 ## Running locally

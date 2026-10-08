@@ -20,10 +20,11 @@ empty columns apart) is built as one mesh per group, each in its own
 sub-folder of <name>_mesh/ listed in <name>_mesh/meshes.json.
 
 Exit status: 0 built and every gating requirement passed; 2 built but a
-gating requirement failed (the files are left in place; --allow-fail
-turns this into 0); 1 the build itself failed. Gating requirements are
-all of the experiment's checks except "7 angles >= 20 deg" and "2 layers
-loaded", which are reported as warnings.
+gating requirement failed (the files and the intermediates are left in
+place; --allow-fail turns this into 0); 1 the build itself failed.
+Gating requirements are all of the experiment's checks except "7 angles
+>= 20 deg" and "2 layers loaded", which are reported as warnings, plus
+the finalize reverse-edge check and "no z16 tile failed to decode".
 """
 import argparse
 import datetime as dt
@@ -107,7 +108,7 @@ def main(argv=None):
     ap.add_argument("--archive", action="store_true", help="also write <name>_mesh.tar.zst")
     ap.add_argument("--allow-fail", action="store_true", help="exit 0 even when a gating requirement fails")
     ap.add_argument("--keep-intermediate", action="store_true",
-                    help="keep z16_layers/, build/ and final/ (default: removed after a successful build)")
+                    help="keep z16_layers/, build/ and final/ (default: removed when every gating requirement passes, kept otherwise)")
     ap.add_argument("--box", metavar="W,S,E,N",
                     help="diagnostic: mesh exactly this rectangle (tile grid from its south-west corner, "
                          "as the experiment's D1 box) instead of the rectangle derived from the z16 cells")
@@ -212,7 +213,10 @@ def main(argv=None):
                        "meshes": [{"dir": r["dir"], "box": r["box"], "triangles": r["triangles"]} for r in results]},
                       f, indent=1)
     if dec["failed"]:
-        warnings.append(("decode", "tiles failed to decode", f"{len(dec['failed'])}"))
+        # A tile that does not decode drops its hazards, depth areas and land
+        # silently; nothing downstream can detect that, so it gates.
+        failures.append(("decode", "tiles failed to decode",
+                         f"{len(dec['failed'])}: {dec['failed'][:5]}"))
 
     # ---- sidecar
     chart_meta = []
@@ -258,9 +262,11 @@ def main(argv=None):
         arc = make_archive(a.out, f"{name}_mesh", log)
         log(f"archive: {arc} ({os.path.getsize(arc)/1e6:.0f} MB)")
 
-    if not a.keep_intermediate:
+    if not a.keep_intermediate and not failures:
         for d in ("z16_layers", "build", "final"):
             shutil.rmtree(os.path.join(work, d), ignore_errors=True)
+    elif failures and not a.keep_intermediate:
+        log(f"intermediates kept in {work} for diagnosis (a gating requirement failed)")
 
     log(f"\n==== {name}: {side['triangles']:,} triangles in {side['mesh_tiles']} tiles, "
         f"{side['bytes']/1e6:.0f} MB, {time.time()-t_start:.0f} s")

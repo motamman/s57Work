@@ -870,7 +870,7 @@ def run(workers, log=print):
             results.append(st)
             log(f"[{time.time()-t1:7.0f}s] {k+1}/{len(tiles)} tile {st['i']},{st['j']} "
                 f"{'ok' if st['ok'] else 'FAIL ' + st.get('error', '')} "
-                f"{sum(st['T'].values()):.1f}s tris_b={st.get('tris_b', '-')}")
+                f"{sum(st['T'].values()):.1f}s cdt={st.get('tris_a', '-')}")
     t_tiles = time.time() - t1
 
     # ---- seam consistency of the tiles' noded input (PSLG): identical seam
