@@ -175,6 +175,15 @@ it:
 - the release notes rewritten by `release-notes.sh` (shared with the
   chart workflow): charts section, then a navigation meshes section.
 
+First CI run (2026-10-08, branch test, 01CGD from the chart staged the
+same day): `ubuntu-latest`, `workers: 2`; 864 tiles, 35,668,991
+triangles in 494 tiles, every gating check passed; build step 33 min,
+job 40 min, staging 2.5 min; peak RSS as Linux reports it 15.0 GB main
+process and 11.6 GB largest child (the refinement fork), so two workers
+fit the 16 GB runner with little margin. The land-polygon download took
+5.5 min uncached. GitHub's larger runners are not available to personal
+accounts, so the standard runner is the only one.
+
 Test pathway (`publish: test`, the default for manual runs): the same
 outputs go to R2 `charts-test/<branch>/` (archive, sidecar and
 `mesh/<D>/` folder) and the run artifacts; a branch's run reads the

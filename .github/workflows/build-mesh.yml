@@ -262,25 +262,27 @@ jobs:
           case "$BUCKET" in
             */*) PUB="$PUB/${BUCKET#*/}" ;;
           esac
+          # Keep the chart's own file name: the sidecar records it as the source.
           mkdir -p chart
           echo "chart: $PREFIX/$STEM"
-          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o chart/chart.mbtiles "$PUB/$PREFIX/$STEM.mbtiles"
-          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o chart/chart.json "$PUB/$PREFIX/$STEM.json"
+          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o "chart/$STEM.mbtiles" "$PUB/$PREFIX/$STEM.mbtiles"
+          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o "chart/$STEM.json" "$PUB/$PREFIX/$STEM.json"
           ls -lh chart/
-          python3 -c "import json; m=json.load(open('chart/chart.json')); print('chart build_date', m.get('build_date'), 'bounds', m.get('bounds'))"
+          python3 -c "import json,os; m=json.load(open('chart/%s.json' % os.environ['STEM'])); print('chart build_date', m.get('build_date'), 'bounds', m.get('bounds'))"
 
       - name: Build the mesh
         env:
           DISTRICT: ${{ matrix.district.district }}
+          STEM: ${{ matrix.district.stem }}
           WORKERS: ${{ matrix.district.workers }}
         run: |
           shp=$(find land -name land_polygons.shp | head -1)
           if [ -z "$shp" ]; then echo "::error::land_polygons.shp not found under land/"; exit 1; fi
           set +e
-          python3 build-mesh.py chart/chart.mbtiles \
+          python3 build-mesh.py "chart/$STEM.mbtiles" \
             --land "$shp" \
             --name "$DISTRICT" \
-            --chart-json chart/chart.json \
+            --chart-json "chart/$STEM.json" \
             -o out -j "$WORKERS" --archive
           rc=$?
           set -e
