@@ -180,11 +180,14 @@ jobs:
                   reason = "forced"
               elif not publish:
                   reason = "test run"
+              # No URL here: the public host is a secret, and GitHub drops a
+              # job output that contains a secret. The build job rebuilds
+              # the URL from prefix + stem.
               matrix.append({
                   "name": name,
                   "district": district,
-                  "chart_url": f"{pub}/{prefix}/{stem}.mbtiles",
-                  "chart_json_url": f"{pub}/{prefix}/{stem}.json",
+                  "prefix": prefix,
+                  "stem": stem,
                   "runner": runner,
                   "workers": workers,
               })
@@ -249,12 +252,20 @@ jobs:
 
       - name: Download the chart
         env:
-          URL: ${{ matrix.district.chart_url }}
-          JSON_URL: ${{ matrix.district.chart_json_url }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PREFIX: ${{ matrix.district.prefix }}
+          STEM: ${{ matrix.district.stem }}
         run: |
+          PUB="${R2_PUBLIC_URL%/}"
+          BUCKET="${R2_BUCKET%/}"
+          case "$BUCKET" in
+            */*) PUB="$PUB/${BUCKET#*/}" ;;
+          esac
           mkdir -p chart
-          curl -fSL --retry 3 --retry-delay 10 -o chart/chart.mbtiles "$URL"
-          curl -fSL --retry 3 --retry-delay 10 -o chart/chart.json "$JSON_URL"
+          echo "chart: $PREFIX/$STEM"
+          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o chart/chart.mbtiles "$PUB/$PREFIX/$STEM.mbtiles"
+          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o chart/chart.json "$PUB/$PREFIX/$STEM.json"
           ls -lh chart/
           python3 -c "import json; m=json.load(open('chart/chart.json')); print('chart build_date', m.get('build_date'), 'bounds', m.get('bounds'))"
 
