@@ -1,0 +1,495 @@
+name: Build Navigation Meshes
+
+# Builds the routing mesh of each published district chart (build-mesh.py,
+# see docs/MESH.md) and publishes it beside the charts: <D>_mesh.tar.zst
+# and <D>_mesh.json on the 'latest' release and R2 charts/, the unpacked
+# folder at R2 charts/mesh/<D>/ (a plain mirror of it is a valid plugin
+# meshDir), and charts/mesh/index.json listing every mesh.
+#
+# Runs after every "Build ENC Charts" run on the default branch. Nothing
+# tells it which districts changed: it compares each chart's build_date
+# (charts/<D>_ENCs.json) with the chart_build_date its mesh was built
+# from (charts/<D>_mesh.json) and rebuilds the stale ones. A chart run
+# that did not publish leaves every date unchanged, so the mesh run ends
+# in seconds. Manual runs can name districts, force a rebuild, and use
+# the same test pathway as the charts (R2 charts-test/<branch>/).
+
+on:
+  workflow_run:
+    workflows: ["Build ENC Charts"]
+    types: [completed]
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      builds:
+        description: 'Comma-separated build names (empty: the mesh.active list in enc-sources.yaml)'
+        required: false
+        default: ''
+      publish:
+        description: >-
+          test: build only; outputs go to run artifacts and R2 charts-test/<branch>/.
+          release: publish to the 'latest' release and R2 charts/ (default branch only).
+        type: choice
+        required: true
+        default: test
+        options:
+          - test
+          - release
+      force:
+        description: 'Rebuild even when the mesh is already current (release mode; test mode always builds)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Step 1: which districts, and does this run publish ───────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      names: ${{ steps.plan.outputs.names }}
+      publish: ${{ steps.mode.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Decide whether this run publishes
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          CHOICE: ${{ github.event.inputs.publish }}
+          REF: ${{ github.ref_name }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          UPSTREAM: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          publish=false
+          if [ "$EVENT" = "workflow_run" ]; then
+            # Only ever fires for the default branch's chart workflow.
+            if [ "$UPSTREAM" != "success" ]; then
+              echo "Chart build concluded '$UPSTREAM'; meshes stay as they are." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "publish=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            publish=true
+          elif [ "$CHOICE" = "release" ]; then
+            if [ "$REF" != "$DEFAULT" ]; then
+              echo "::error::'release' is only allowed from $DEFAULT (this run is on $REF). Merge first, or run as 'test'."
+              exit 1
+            fi
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          if [ "$publish" = true ]; then
+            echo "This run PUBLISHES meshes to the 'latest' release and R2 charts/." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "TEST run: meshes go to run artifacts and R2 charts-test/ only." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install pyyaml
+        if: steps.mode.outputs.publish != 'skip'
+        run: pip install pyyaml
+
+      - name: Plan the builds (stale meshes, or the named ones)
+        id: plan
+        if: steps.mode.outputs.publish != 'skip'
+        shell: python3 {0}
+        env:
+          OVERRIDE: ${{ github.event.inputs.builds }}
+          FORCE: ${{ github.event.inputs.force }}
+          PUBLISH: ${{ steps.mode.outputs.publish }}
+          REF: ${{ github.ref_name }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          import json, os, sys, urllib.request, urllib.error, yaml
+
+          with open("enc-sources.yaml") as f:
+              config = yaml.safe_load(f)
+          mesh_cfg = config.get("mesh", {})
+          override = os.environ["OVERRIDE"].strip()
+          active = [b.strip() for b in override.split(",")] if override else mesh_cfg.get("active", [])
+          runner = mesh_cfg.get("runner", "ubuntu-latest")
+          workers = int(mesh_cfg.get("workers", 2))
+          force = os.environ["FORCE"] == "true"
+          publish = os.environ["PUBLISH"] == "true"
+          ref = os.environ["REF"]
+
+          pub = os.environ["R2_PUBLIC_URL"].rstrip("/")
+          bucket = os.environ["R2_BUCKET"].rstrip("/")
+          if not pub:
+              print("::error::R2_PUBLIC_URL is not set; the mesh build reads the published charts from R2")
+              sys.exit(1)
+          if "/" in bucket:
+              pub = f"{pub}/{bucket.split('/', 1)[1]}"
+
+          def fetch_json(url):
+              # Cloudflare answers 403 to urllib's default user agent.
+              req = urllib.request.Request(url, headers={"User-Agent": "s57Work-build-mesh"})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return None
+                  raise
+
+          matrix, names, lines = [], [], []
+          for name in active:
+              b = config["builds"].get(name)
+              if not b:
+                  print(f"WARNING: build '{name}' not found in enc-sources.yaml, skipping")
+                  continue
+              stem = b["sources"][0].rsplit(".", 1)[0]          # 01CGD_ENCs
+              district = stem[:-5] if stem.endswith("_ENCs") else stem
+              # Where the chart comes from: a test run on a branch prefers
+              # that branch's staged charts, then falls back to charts/.
+              prefixes = ["charts"] if publish else [f"charts-test/{ref}", "charts"]
+              chart = None
+              for prefix in prefixes:
+                  meta = fetch_json(f"{pub}/{prefix}/{stem}.json")
+                  if meta:
+                      chart = (prefix, meta)
+                      break
+              if not chart:
+                  lines.append(f"- {name}: no published chart found ({', '.join(prefixes)}), skipped")
+                  continue
+              prefix, meta = chart
+              chart_date = meta.get("build_date")
+              reason = "named" if override else "stale"
+              if publish and not force:
+                  side = fetch_json(f"{pub}/charts/{district}_mesh.json")
+                  have = side.get("chart_build_date") if side else None
+                  if side and have and chart_date and have >= chart_date:
+                      lines.append(f"- {name}: mesh current (chart {chart_date}, mesh built from {have}), skipped")
+                      continue
+                  reason = "no mesh yet" if not side else f"chart {chart_date} newer than mesh's {have}"
+              elif force:
+                  reason = "forced"
+              elif not publish:
+                  reason = "test run"
+              # No URL here: the public host is a secret, and GitHub drops a
+              # job output that contains a secret. The build job rebuilds
+              # the URL from prefix + stem.
+              matrix.append({
+                  "name": name,
+                  "district": district,
+                  "prefix": prefix,
+                  "stem": stem,
+                  "runner": runner,
+                  "workers": workers,
+              })
+              names.append(f"mesh-{district}")
+              lines.append(f"- {name}: build ({reason}; chart from {prefix}/, {chart_date})")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps(matrix)}\n")
+              f.write(f"names={json.dumps(names)}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("### Mesh plan\n\n" + ("\n".join(lines) if lines else "- nothing to build") + "\n")
+          print("\n".join(lines) if lines else "nothing to build")
+
+  # ── Step 2: build each mesh ──────────────────────────────────────────
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.publish != 'skip' && needs.prepare.outputs.matrix != '[]'
+    runs-on: ${{ matrix.district.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        district: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: mesh/requirements.txt
+
+      - name: Install the mesh build's Python packages
+        run: |
+          pip install -r mesh/requirements.txt
+          python3 -c "import numpy, scipy, shapely, triangle, mapbox_vector_tile, shapefile; print('shapely', shapely.__version__, 'numpy', numpy.__version__)"
+          zstd --version
+
+      # The OSM land mask: ~700 MB zip from osmdata.openstreetmap.de,
+      # updated daily. Cached per calendar month; the data date is read
+      # from the package README and recorded in the mesh sidecar.
+      - name: Land polygons cache key
+        id: landkey
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore land polygons
+        id: land
+        uses: actions/cache@v6
+        with:
+          path: land
+          key: land-polygons-split-4326-${{ steps.landkey.outputs.month }}
+
+      - name: Download land polygons
+        if: steps.land.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p land
+          curl -fSL --retry 3 --retry-delay 10 -o land/land-polygons-split-4326.zip \
+            https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip
+          unzip -q land/land-polygons-split-4326.zip -d land
+          rm land/land-polygons-split-4326.zip
+
+      - name: Download the chart
+        env:
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PREFIX: ${{ matrix.district.prefix }}
+          STEM: ${{ matrix.district.stem }}
+        run: |
+          PUB="${R2_PUBLIC_URL%/}"
+          BUCKET="${R2_BUCKET%/}"
+          case "$BUCKET" in
+            */*) PUB="$PUB/${BUCKET#*/}" ;;
+          esac
+          # Keep the chart's own file name: the sidecar records it as the source.
+          mkdir -p chart
+          echo "chart: $PREFIX/$STEM"
+          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o "chart/$STEM.mbtiles" "$PUB/$PREFIX/$STEM.mbtiles"
+          curl -fSL --retry 3 --retry-delay 10 -A s57Work-build-mesh -o "chart/$STEM.json" "$PUB/$PREFIX/$STEM.json"
+          ls -lh chart/
+          python3 -c "import json,os; m=json.load(open('chart/%s.json' % os.environ['STEM'])); print('chart build_date', m.get('build_date'), 'bounds', m.get('bounds'))"
+
+      - name: Build the mesh
+        env:
+          DISTRICT: ${{ matrix.district.district }}
+          STEM: ${{ matrix.district.stem }}
+          WORKERS: ${{ matrix.district.workers }}
+        run: |
+          shp=$(find land -name land_polygons.shp | head -1)
+          if [ -z "$shp" ]; then echo "::error::land_polygons.shp not found under land/"; exit 1; fi
+          set +e
+          python3 build-mesh.py "chart/$STEM.mbtiles" \
+            --land "$shp" \
+            --name "$DISTRICT" \
+            --chart-json "chart/$STEM.json" \
+            -o out -j "$WORKERS" --archive
+          rc=$?
+          set -e
+          {
+            echo "### Mesh $DISTRICT"
+            echo
+            if [ -f "out/${DISTRICT}_mesh.json" ]; then
+              python3 - <<'EOF'
+          import json, os
+          s = json.load(open(f"out/{os.environ['DISTRICT']}_mesh.json"))
+          print(f"- triangles {s['triangles']:,} in {s['mesh_tiles']} tiles, {s['bytes']/1e6:.0f} MB raw, built in {s['build_seconds']/60:.0f} min")
+          for c in s["clusters"]:
+              print(f"- cluster {c['cluster']}: box {c['box']}, {c['tiles']} tiles, peak RSS main {c['peak_rss_mb']['main']:.0f} MB / worker {c['peak_rss_mb']['largest_worker']:.0f} MB")
+              for r in c["requirements"]:
+                  print(f"  - {'PASS' if r['pass'] else 'FAIL'} {r['name']}: {r['detail'][:160]}")
+          for w in s["warnings"]:
+              print(f"- WARN {w['name']}: {w['detail'][:160]}")
+          EOF
+            else
+              echo "- no sidecar written (build failed before the end)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -lh out/
+          exit $rc
+
+      - name: Upload artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: mesh-${{ matrix.district.district }}
+          path: |
+            out/${{ matrix.district.district }}_mesh.tar.zst
+            out/${{ matrix.district.district }}_mesh.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── Step 3: publish ──────────────────────────────────────────────────
+  # One artifact at a time: a mesh archive is ~1.5 GB and the unpacked
+  # folder ~2.5 GB, so all districts at once would not fit the runner.
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.build.result != 'skipped' && needs.prepare.outputs.publish == 'true' }}
+    permissions:
+      contents: write   # release assets
+      actions: read     # gh run download of this run's artifacts
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Publish each mesh to the release and R2
+        env:
+          NAMES: ${{ needs.prepare.outputs.names }}
+        run: |
+          BUCKET="${BUCKET%/}"
+          MAX_ASSET_SIZE=2147483648
+          if ! gh release view "latest" >/dev/null 2>&1; then
+            echo "::error::no 'latest' release yet; run the chart build first"
+            exit 1
+          fi
+          failed=""
+          for art in $(echo "$NAMES" | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            rm -rf work && mkdir work
+            if ! gh run download "$GITHUB_RUN_ID" -n "$art" -D work; then
+              echo "::warning::$art: no artifact (its build failed); not published"
+              continue
+            fi
+            tar=$(ls work/*_mesh.tar.zst); json=$(ls work/*_mesh.json)
+            d=$(basename "$tar" _mesh.tar.zst)
+            echo "=== $d ($(numfmt --to=iec $(stat -c%s "$tar")))"
+            ok=true
+            # release assets (the archive only when under GitHub's limit)
+            if [ "$(stat -c%s "$tar")" -lt "$MAX_ASSET_SIZE" ]; then
+              gh release upload "latest" --clobber "$tar" || { ok=false; failed="$failed $d:release"; }
+            else
+              echo "::warning::$d: archive exceeds 2 GiB, R2 only"
+            fi
+            if [ -n "$R2_ACCOUNT_ID" ]; then
+              aws s3 cp --endpoint-url "$ENDPOINT" --no-progress "$tar" "s3://$BUCKET/charts/$(basename "$tar")" || { ok=false; failed="$failed $d:r2"; }
+              # the unpacked folder: a mirror of charts/mesh/<D>/ is a meshDir
+              if $ok; then
+                tar --zstd -xf "$tar" -C work || { ok=false; failed="$failed $d:extract"; }
+              fi
+              if $ok; then
+                aws s3 sync --endpoint-url "$ENDPOINT" --no-progress --delete \
+                  "work/${d}_mesh" "s3://$BUCKET/charts/mesh/$d/" || { ok=false; failed="$failed $d:r2-sync"; }
+              fi
+            fi
+            # The sidecar goes last, and only when everything before it
+            # succeeded: the next run's plan reads its chart_build_date to
+            # decide the mesh is current, so it must never describe a mesh
+            # whose archive or folder did not land.
+            if $ok; then
+              gh release upload "latest" --clobber "$json" || failed="$failed $d:release-json"
+              if [ -n "$R2_ACCOUNT_ID" ]; then
+                aws s3 cp --endpoint-url "$ENDPOINT" --no-progress "$json" "s3://$BUCKET/charts/$(basename "$json")" || failed="$failed $d:r2-json"
+              fi
+            else
+              echo "::warning::$d: sidecar not published; the mesh stays marked stale and is rebuilt next run"
+            fi
+          done
+          rm -rf work
+          if [ -n "$failed" ]; then
+            echo "Failed:$failed"
+            exit 1
+          fi
+
+      - name: Write charts/mesh/index.json (every published mesh)
+        if: ${{ env.R2_ACCOUNT_ID != '' }}
+        run: |
+          BUCKET="${BUCKET%/}"
+          mkdir -p sidecars
+          for key in $(aws s3 ls --endpoint-url "$ENDPOINT" "s3://$BUCKET/charts/" | awk '$4 ~ /_mesh\.json$/ {print $4}'); do
+            aws s3 cp --endpoint-url "$ENDPOINT" --no-progress "s3://$BUCKET/charts/$key" "sidecars/$key"
+          done
+          python3 - <<'EOF'
+          import glob, json, datetime
+          meshes = []
+          for p in sorted(glob.glob("sidecars/*_mesh.json")):
+              s = json.load(open(p))
+              meshes.append({
+                  "name": s["name"], "dir": f"mesh/{s['name']}/", "archive": f"{s['name']}_mesh.tar.zst",
+                  "sidecar": f"{s['name']}_mesh.json", "build_date": s["build_date"],
+                  "chart_build_date": s.get("chart_build_date"), "format": s["format"],
+                  "triangles": s["triangles"], "bytes": s["bytes"],
+                  "clusters": [{"dir": c["dir"], "box": c["box"]} for c in s["clusters"]],
+              })
+          json.dump({"version": 1, "updated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "meshes": meshes}, open("index.json", "w"), indent=1)
+          print(json.dumps(meshes, indent=1))
+          EOF
+          aws s3 cp --endpoint-url "$ENDPOINT" --no-progress index.json "s3://$BUCKET/charts/mesh/index.json"
+
+      - name: Rewrite the release notes (charts and meshes)
+        if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_PUBLIC_URL != '' }}
+        run: |
+          ./release-notes.sh > notes.md
+          cat notes.md
+          gh release edit "latest" --notes-file notes.md
+
+  # ── Test pathway: stage where nothing published is touched ───────────
+  test-stage:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.build.result != 'skipped' && needs.prepare.outputs.publish == 'false' }}
+    permissions:
+      contents: read
+      actions: read     # gh run download of this run's artifacts
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      REF: ${{ github.ref_name }}
+    steps:
+      - name: Stage each mesh to R2 charts-test/<branch>/
+        env:
+          NAMES: ${{ needs.prepare.outputs.names }}
+        run: |
+          BUCKET="${BUCKET%/}"
+          prefix="charts-test/$REF"
+          PUB="${R2_PUBLIC_URL%/}"
+          case "$BUCKET" in
+            */*) PUB="$PUB/${BUCKET#*/}" ;;
+          esac
+          {
+            echo "### Test mesh outputs (not published)"
+            echo
+            echo "Run artifacts (7 days): see this run's Artifacts panel."
+            [ -n "$R2_ACCOUNT_ID" ] && echo "R2 test prefix: s3://$BUCKET/$prefix/"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=""
+          for art in $(echo "$NAMES" | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            rm -rf work && mkdir work
+            if ! gh run download "$GITHUB_RUN_ID" -n "$art" -D work; then
+              echo "::warning::$art: no artifact (its build failed)"
+              continue
+            fi
+            tar=$(ls work/*_mesh.tar.zst); json=$(ls work/*_mesh.json)
+            d=$(basename "$tar" _mesh.tar.zst)
+            if [ -z "$R2_ACCOUNT_ID" ]; then
+              echo "- $d: artifact only (no R2 secrets)" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            ok=true
+            aws s3 cp --endpoint-url "$ENDPOINT" --no-progress "$tar" "s3://$BUCKET/$prefix/$(basename "$tar")" || ok=false
+            aws s3 cp --endpoint-url "$ENDPOINT" --no-progress "$json" "s3://$BUCKET/$prefix/$(basename "$json")" || ok=false
+            tar --zstd -xf "$tar" -C work
+            aws s3 sync --endpoint-url "$ENDPOINT" --no-progress --delete \
+              "work/${d}_mesh" "s3://$BUCKET/$prefix/mesh/$d/" || ok=false
+            if $ok; then
+              echo "- [$(basename "$tar")]($PUB/$prefix/$(basename "$tar")), [$(basename "$json")]($PUB/$prefix/$(basename "$json")), folder $PUB/$prefix/mesh/$d/" >> "$GITHUB_STEP_SUMMARY"
+            else
+              failed="$failed $d"
+            fi
+          done
+          rm -rf work
+          if [ -n "$failed" ]; then
+            echo "Failed R2 staging:$failed"
+            exit 1
+          fi

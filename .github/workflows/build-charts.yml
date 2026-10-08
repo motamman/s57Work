@@ -266,6 +266,8 @@ jobs:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
     steps:
+      - uses: actions/checkout@v7   # for release-notes.sh
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -378,36 +380,10 @@ jobs:
           ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          BUCKET="${BUCKET%/}"  # tolerate a trailing slash in the secret
-          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          PUB="${R2_PUBLIC_URL%/}"
-          # R2_BUCKET may include an in-bucket folder ("bucket/folder");
-          # the public host serves from the bucket root, so append that
-          # folder to the link base here. R2_PUBLIC_URL never needs to
-          # be anything but the bare public hostname.
-          case "$BUCKET" in
-            */*) PUB="$PUB/${BUCKET#*/}" ;;
-          esac
-          MAX_ASSET_SIZE=2147483648
-
-          {
-            echo "Automated ENC chart build from NOAA S-57 data. Last update: $DATE."
-            echo
-            echo "### All charts on R2 (no size limit)"
-            echo
-            aws s3 ls --endpoint-url "$ENDPOINT" "s3://$BUCKET/charts/" \
-              | awk '$4 ~ /\.(mbtiles|pmtiles)$/ {print $3, $4}' | sort -k2 \
-              | while read -r size name; do
-                  note=""
-                  if [ "$size" -ge "$MAX_ASSET_SIZE" ]; then
-                    note=" *(R2 only — exceeds GitHub's 2 GiB asset limit)*"
-                  fi
-                  echo "- [$name]($PUB/charts/$name) ($(numfmt --to=iec "$size")B)$note"
-                done
-            echo
-            echo "Each district is published twice with identical tiles: \`.mbtiles\` (SQLite) and \`.pmtiles\` (single-file archive for HTTP range requests). Per-chart metadata: same URLs with \`.json\`."
-          } > notes.md
-
+          # Shared with build-mesh.yml so a mesh run and a chart run write
+          # the same notes (charts section + navigation meshes section).
+          chmod +x release-notes.sh
+          ./release-notes.sh > notes.md
           cat notes.md
           gh release edit "latest" --notes-file notes.md
 
