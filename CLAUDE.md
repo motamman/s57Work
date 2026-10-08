@@ -13,7 +13,7 @@ Tests: `python3 -m unittest discover -s tests -t .` (standard library only, no p
 - **GDAL** (`ogr2ogr`, `ogrinfo`) — native install or via container (`ghcr.io/osgeo/gdal:alpine-small-latest`) using podman/docker. By-band mode also needs the SQLite dialect's spatial functions (`ST_Union`, `ST_Difference`), i.e. a GDAL built with SpatiaLite or GEOS; Ubuntu's `gdal-bin` and Homebrew's `gdal` both qualify (verified Sept 2026)
 - **tippecanoe + tile-join** — converts GeoJSON to vector `.mbtiles` tiles (native install)
 - **go-pmtiles** (`pmtiles`) — optional; `--pmtiles` converts the finished `.mbtiles` into a sibling `.pmtiles` archive (`write_pmtiles`). Runs after `_patch_metadata` so `type=S-57` and `vector_layers` carry over; tile-join's own PMTiles output would reset the type to `overlay`. The `.mbtiles` stays the master for resume and the diagnostics. Pinned to 1.31.2 in both workflows
-- **Python 3** — standard library only
+- **Python 3** — standard library only for the chart tool. The mesh build (`build-mesh.py`) needs `mesh/requirements.txt` (numpy, scipy, shapely 2.1, mapbox-vector-tile, pyshp, triangle) and `tar --zstd`; only the mesh workflow and the mesh tests install them
 
 ## Running
 
@@ -54,9 +54,14 @@ All artifacts stored in `./data/` and preserved between runs for resume capabili
 - **Skipped layers**: `DSID`, `C_AGGR`, `C_ASSO`, `Generic` are metadata-only and excluded from GDAL export. `DSID` is still read per cell (`read_cell_dsid`) for the cancellation check; it is the only record that says whether a cell is alive.
 - **Layer naming**: GeoJSON filenames like `DEPARE_US5MA1SK.geojson` — the tippecanoe layer name is the stem with a trailing NOAA cell name removed (`layer_name_from_stem`). Layer names can contain underscores (`M_COVR`, `M_QUAL`, `TS_FEB`), so never split on the first one.
 
+## Navigation mesh (`build-mesh.py`, `mesh/`)
+
+The District 1 mesh experiment of Oct 2026 made district-agnostic, stage for stage (see `docs/MESH.md`; the user's standing instruction is to reproduce it exactly and ask before changing anything). Four stages with the experiment's intermediate files under `data/mesh/<name>/`: decode the chart's z16 tiles to per-layer pickles (`mesh/decode.py`), derive the extent (`mesh/extent.py`: the rectangle around every 0.25° cell holding a z16 tile, cells counted from −180°+0.000125°/−90°+0.000125° so no seam lies on the sounding grid's 0.00025° lattice, which on 01CGD kept 14,954 label-differing seam segments instead of 26 and made the refinement 5.7× slower; split into longitude clusters at gaps over 4°; one `xScale` = cos(mid-latitude) per cluster; `--box` overrides for diagnostics), the tile build + seam weld + global Triangle q20 refinement + checks (`mesh/build.py`, the experiment's `build_mesh_full.py` with globals replaced by `configure()`), finalize (`mesh/finalize.py`) and the `WRPMESH1` binary tiles + `index.json` version 1 (`mesh/binary.py`) that the signalk-weather-router-plus plugin reads from its `meshDir`. Output: `<name>_mesh/`, `<name>_mesh.json` sidecar (provenance, extent, counts, every requirement PASS/FAIL), `--archive` → `<name>_mesh.tar.zst`. Exit 2 when a gating requirement fails (all but "2 layers loaded" and "7 angles"), so CI never publishes a failed mesh. The old grid's lattice origin (−75.5, 38.7, 0.00025°) stays verbatim. Tests: `tests/test_mesh_extent.py` (stdlib) and `tests/test_mesh_pipeline.py` (fixture chart → mesh, skips without GDAL/tippecanoe/mesh packages; land fixture in `tests/fixtures/land/`).
+
 ## CI / GitHub Actions
 
-- `enc-sources.yaml` — defines all available builds (CG districts and individual states) with an `active` list controlling which run
+- `enc-sources.yaml` — defines all available builds (CG districts and individual states) with an `active` list controlling which run; the `mesh:` section (`runner`, `workers`, `active`) drives the mesh workflow. 17cgd is not in `mesh.active`: its cells straddle the antimeridian
+- `.github/workflows/build-mesh.yml` — runs after every "Build ENC Charts" run on main (and on demand with the same `publish` test/release input). Rebuilds a district's mesh when the published chart's `build_date` is newer than the mesh sidecar's `chart_build_date` (`force` overrides; test runs always build). Reads the chart from R2, publishes `<D>_mesh.tar.zst` + `<D>_mesh.json` to the release and R2 `charts/`, syncs the unpacked folder to `charts/mesh/<D>/`, rewrites `charts/mesh/index.json`, and the release notes via `release-notes.sh` (shared with the chart workflow)
 - `.github/workflows/build-charts.yml` — downloads ENC ZIPs from NOAA, runs the pipeline, uploads `.mbtiles` as GitHub Release assets
 - Manual trigger supports overriding the active build list. **Test pathway**: the `publish` input defaults to `test`, which builds everything but leaves the `latest` release and R2 `charts/` untouched; outputs go to run artifacts (7 days) and R2 `charts-test/<branch>/` (job `test-stage`), and `verify-r2-charts.py --prefix charts-test/<branch>` reads them. `release` publishes and is refused off the default branch. Scheduled runs always publish
 
@@ -64,6 +69,9 @@ All artifacts stored in `./data/` and preserved between runs for resume capabili
 
 ```
 s57-to-mbtiles.py          # the tool
+build-mesh.py               # navigation mesh of a finished chart file (mesh/ package, docs/MESH.md)
+mesh/                       # decode.py extent.py build.py finalize.py binary.py cli.py requirements.txt
+release-notes.sh            # 'latest' release notes from the R2 listing; used by both workflows
 check-tile-overlap.py       # diagnostic: shared tile addresses between tilesets, per-tile layer counts
 check-tile-duplicates.py    # diagnostic: chart cells stacked and exact duplicate features per tile in a merged file
 count-layer-by-zoom.py      # diagnostic: one layer's feature count per zoom over a bbox (compare builds)
@@ -84,4 +92,5 @@ data/                       # gitignored working directory
 - `docs/INSTALL.md` — install guide for tippecanoe, GDAL, podman/docker (Raspberry Pi and macOS)
 - `docs/USAGE.md` — detailed usage guide covering all five modes of operation and CLI options
 - `docs/SOUNDG-FIX.md` — documents the SOUNDG depth sounding fix (both the tile generation bug and the Freeboard-SK rendering bug)
+- `docs/MESH.md` — the navigation mesh: inputs, stages and files, extent rule, binary format, sidecar, gating, the mesh workflow, and the agreed list of differences from the experiment
 - `docs/SAME-BAND-OVERLAP.md` — NOAA ships legacy and reschemed cells of the same band with overlapping data (an S-57 App. B.1 §2.2 violation); evidence, standards, NOAA's stated intent, how OpenCPN and others cope, and the Stage 2b mechanism (reschemed wins, bands 1-2)

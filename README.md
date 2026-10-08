@@ -72,6 +72,8 @@ active:
 
 Finished `.mbtiles` files are uploaded as GitHub Release assets. Builds run automatically on the 1st of each month (April-November) or manually from the Actions tab.
 
+A second workflow, "Build Navigation Meshes", runs after each chart publish and builds a routing mesh of every district whose chart is newer than its mesh (`build-mesh.py`, see [docs/MESH.md](docs/MESH.md)). The mesh is published beside the charts as `<district>_mesh.tar.zst` and `<district>_mesh.json`, and unpacked at `charts/mesh/<district>/` on R2. The `mesh:` section of `enc-sources.yaml` lists the districts.
+
 ## Forking
 
 This repo is designed to be forked. Each fork maintains its own builds and releases independently.
@@ -115,6 +117,7 @@ In by-band mode each band also renders two zoom levels past its native ceiling (
 - [docs/INSTALL.md](docs/INSTALL.md) — Installation guide (macOS, Raspberry Pi)
 - [docs/USAGE.md](docs/USAGE.md) — Detailed usage guide with all CLI options
 - [docs/SOUNDG-FIX.md](docs/SOUNDG-FIX.md) — Depth sounding fix writeup
+- [docs/MESH.md](docs/MESH.md) — Navigation mesh build and workflow
 
 ## License
 

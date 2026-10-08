@@ -412,3 +412,21 @@ active:
   # assets are skipped automatically for files over 2 GiB.
   - 17cgd
   
+
+# ─── Navigation meshes (build-mesh.yml) ────────────────────────────────
+# Districts whose published chart gets a routing mesh (docs/MESH.md).
+# The mesh workflow runs after every chart publish and rebuilds a mesh
+# when its chart is newer. 17cgd is left out until asked for: its cells
+# cross the antimeridian (Aleutians), which one rectangle cannot hold.
+mesh:
+  runner: ubuntu-latest   # a larger runner label here if one is available
+  workers: 2              # tile workers; each held up to ~4 GB on District 1
+  active:
+    - 01cgd
+    - 05cgd
+    - 07cgd
+    - 08cgd
+    - 09cgd
+    - 11cgd
+    - 13cgd
+    - 14cgd

@@ -1,0 +1,11 @@
+# Navigation mesh build (build-mesh.py). The chart tool itself stays
+# standard-library-only; only the mesh job installs these.
+# Versions are the ones the experiment's final District 1 build ran with
+# (macOS, Python 3.14), except triangle: 20200424 was built from source
+# there, 20250106 is the same Triangle code with wheels for Linux.
+numpy>=2.0
+scipy>=1.14
+shapely>=2.1,<3
+mapbox-vector-tile>=2.1
+pyshp>=2.3
+triangle>=20250106
