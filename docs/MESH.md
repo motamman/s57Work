@@ -122,6 +122,7 @@ to the sidecar. All of them gate except two:
 | 12 | neighbour links symmetric | yes |
 | 13 | penalties in range | yes |
 | 14 | the 3 × 3 block around the densest tile loads from the files alone | yes |
+| 15 | chart coverage (`M_COVR`) present in the decoded input, also under `--reuse-decoded` | yes |
 | 9, 10, 11 | medial axis step, hazard columns, time measured | yes (always pass) |
 
 Plus two more that gate: the finalize step's reverse-edge check, and
@@ -249,7 +250,9 @@ experiment as it was.
 - **Requirement 14**: the route-ready region is the 3 × 3 block around
   the tile with the most triangles instead of a fixed Woods Hole box.
 - **Gating**: the experiment printed the requirements and exited 0;
-  here all but 2 and 7 gate.
+  here all but 2 and 7 gate, and requirement 15 (chart coverage
+  loaded) is new: without `M_COVR` the OSM land overrides the chart
+  everywhere, so a decoded input without it is never published.
 - **Parameters** replace env vars and constants: output and land paths,
   `--snap-discs` (the experiment's `MESH_SNAP`), `--debug-point`
   (`MESH_DEBUG`). The old grid's cell lattice origin (−75.5, 38.7,

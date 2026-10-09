@@ -131,6 +131,9 @@ class MeshPipeline(unittest.TestCase):
         self.assertIn("M_COVR", s["clusters"][0]["layers"])
         self.assertIn("SOUNDG", s["clusters"][0]["layers"])
         self.assertIn("2 layers loaded", [w["name"] for w in s["warnings"]])
+        req = {r["name"]: r for r in s["clusters"][0]["requirements"]}
+        self.assertTrue(req["15 chart coverage loaded"]["pass"], req["15 chart coverage loaded"]["detail"])
+        self.assertTrue(s["passed"], s["gating_failures"])
 
     def test_archive_and_intermediates(self):
         arc = self.out / "MINI_mesh.tar.zst"

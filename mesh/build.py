@@ -1275,6 +1275,12 @@ def run(workers, log=print):
          f"3x3 region around the densest tile (SW corner {region_lonlat[0]:.2f}, {region_lonlat[1]:.2f}) loaded from files alone "
          f"in {t_region:.2f} s: {len(region_tri):,} triangles, files missing routing arrays {rs}, "
          f"neighbour links leaving the region {int((~inside).sum()):,} of {len(inside):,}"),
+        # Without M_COVR the OSM land polygons override the chart everywhere
+        # (the Great Lakes, the Hudson, every harbour behind the OSM
+        # coastline become land), so its absence gates: an old z16_layers
+        # reused with --reuse-decoded, or a chart whose tiles lack it.
+        ("15 chart coverage loaded", INV.get("M_COVR", 0) > 0,
+         f"M_COVR pieces {INV.get('M_COVR', 0):,}" if INV.get("M_COVR", 0) else "no M_COVR in the decoded input"),
         ("9 medial axis", MEDIAL_STEP * DEG_M <= 10.0 + 1e-9, f"boundary sampled every {MEDIAL_STEP*DEG_M:.0f} m"),
         ("10 hazard data stored", True, "VALSOU (hazv) and CATZOC columns in every tile's attribute table"),
         ("11 time measured", True, f"{t_total:.1f} s end to end"),

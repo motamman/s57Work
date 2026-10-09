@@ -98,6 +98,13 @@ def main(argv=None):
     if a.mbtiles:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from mesh.decode import decode_to_pickles
+        # The decoder only writes the layers the inputs contain: a pickle
+        # left by an earlier decode of other charts would be read as this
+        # chart's. Only the layer pickles go; anything else stays.
+        if os.path.isdir(a.decoded):
+            for f in os.listdir(a.decoded):
+                if f.endswith(".pkl"):
+                    os.remove(os.path.join(a.decoded, f))
         decode_to_pickles(a.mbtiles, a.decoded, a.workers)
 
     t0 = time.time()
@@ -141,16 +148,16 @@ def main(argv=None):
                 if len(ci):
                     lost_cov = polygonal(shapely.difference(
                         lost, polygonal(shapely.union_all(shapely.intersection(cov[ci], cb))), grid_size=1e-7))
+            a_w, a_lost, a_lost_cov = km2(w, lat), km2(lost, lat), km2(lost_cov, lat)
             rec = {"i": i, "j": j, "west": round(cb.bounds[0], 6), "south": round(cb.bounds[1], 6),
-                   "water_km2": round(km2(w, lat), 3), "osm_land_km2": round(km2(lost, lat), 3),
-                   "osm_land_not_covered_km2": round(km2(lost_cov, lat), 3)}
+                   "water_km2": round(a_w, 3), "osm_land_km2": round(a_lost, 3),
+                   "osm_land_not_covered_km2": round(a_lost_cov, 3)}
             ex = lost_cov if not lost_cov.is_empty else lost
             if not ex.is_empty:
                 c = ex.representative_point()
                 rec["example_lonlat"] = [round(c.x, 5), round(c.y, 5)]
             cells.append(rec)
-            tot["water"] += rec["water_km2"]; tot["osm_land"] += rec["osm_land_km2"]
-            tot["osm_land_not_covered"] += rec["osm_land_not_covered_km2"]
+            tot["water"] += a_w; tot["osm_land"] += a_lost; tot["osm_land_not_covered"] += a_lost_cov
     key = "osm_land_not_covered_km2" if ctree is not None else "osm_land_km2"
     cells.sort(key=lambda r: -r[key])
     print(f"\ncharted water {tot['water']:,.0f} km2; inside OSM land {tot['osm_land']:,.0f} km2 "
