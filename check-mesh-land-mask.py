@@ -158,6 +158,8 @@ def main(argv=None):
                 rec["example_lonlat"] = [round(c.x, 5), round(c.y, 5)]
             cells.append(rec)
             tot["water"] += a_w; tot["osm_land"] += a_lost; tot["osm_land_not_covered"] += a_lost_cov
+    if not tot["water"]:
+        sys.exit("no charted water area in " + a.decoded + ": every water piece collapsed when clipped to its cell")
     key = "osm_land_not_covered_km2" if ctree is not None else "osm_land_km2"
     cells.sort(key=lambda r: -r[key])
     print(f"\ncharted water {tot['water']:,.0f} km2; inside OSM land {tot['osm_land']:,.0f} km2 "
