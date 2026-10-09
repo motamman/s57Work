@@ -1,11 +1,17 @@
 # Navigation mesh build (build-mesh.py). The chart tool itself stays
 # standard-library-only; only the mesh job installs these.
-# Versions are the ones the experiment's final District 1 build ran with
-# (macOS, Python 3.14), except triangle: 20200424 was built from source
-# there, 20250106 is the same Triangle code with wheels for Linux.
-numpy>=2.0
-scipy>=1.14
-shapely>=2.1,<3
-mapbox-vector-tile>=2.1
-pyshp>=2.3
-triangle>=20250106
+#
+# Pinned exactly, like tippecanoe and go-pmtiles in the workflows: a new
+# numpy, scipy, shapely (GEOS) or triangle release can change geometry
+# results with no change in this repository. These are the versions the
+# first CI mesh build installed on 2026-10-08 (Python 3.12, ubuntu-latest)
+# and passed every gating check with (01CGD, 35,668,991 triangles).
+# The experiment's own District 1 build ran the same versions except
+# shapely 2.1.2; both have produced a passing 01CGD mesh. Bump
+# deliberately, then rebuild and re-verify a district.
+numpy==2.5.3
+scipy==1.18.1
+shapely==2.2.0
+mapbox-vector-tile==2.2.0
+pyshp==3.1.6
+triangle==20250106
