@@ -265,6 +265,13 @@ experiment as it was.
   in the rectangle"), the Hudson and every harbour or river behind the
   OSM coastline. `check-mesh-land-mask.py` measures the charted water a
   land mask turns into land, per 0.25° cell.
+- **Requirement 3 within the snap grid** (2026-10-09): a hazard or mark
+  point is looked up in the faces within GS (0.5 m) of it, not by an
+  exact hit. Every input is snapped to that grid, so a point under 0.5 m
+  from a tile edge could sit between the snapped edge and the tile box,
+  in no face of either tile, and fail the gate although its disc was
+  built and flagged (an obstruction 0.17 m east of a seam at New
+  Buffalo, 09CGD).
 - **Not ported**: the experiment's Python routers, grid comparison and
   live-API timing scripts, and the funnel test. Router parity against
   the saved trips is the plugin repository's test.

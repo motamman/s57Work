@@ -37,7 +37,8 @@ Per 0.25 deg tile (processed with a 100 m overlap, then cropped):
   dissolve, 5a CDT (GEOS), 5b quality (Triangle q20, no boundary Steiner
   points), 6 medial axis (Voronoi of boundary every 50 m), 7 write,
   8 checks (every dangerous hazard point and every mark inside a flagged
-  face or on land/structure; land area vs charted+OSM land).
+  face or on land/structure, tested within the snap grid GS; land area vs
+  charted+OSM land).
 Then seam check + reconcile across neighbouring tiles, one global quality
 refinement, neighbours, split into per-tile mesh files, final checks.
 """
@@ -818,7 +819,10 @@ def process_tile(args):
             if kind == "haz" and v is not None and v >= MIN_DEPTH_CHECK:
                 continue
             c[f"{kind}_checked"] += 1
-            hit = ptree.query(p, predicate="intersects") if ptree is not None else []
+            # within the snap grid, not an exact hit: a point under 0.5 m from a
+            # tile edge can fall between the snapped edge and the tile box, in no
+            # face of either tile (New Buffalo, 0.17 m east of a seam, 2026-10-09)
+            hit = ptree.query(p, predicate="dwithin", distance=GS) if ptree is not None else []
             if len(hit):
                 ci_ = cols.index("haz" if kind == "haz" else "mark")
                 flag = all(ukeys[part_key[h]][ci_] for h in hit)
@@ -828,7 +832,7 @@ def process_tile(args):
                     c[f"{kind}_bad"] += 1
                     if len(bad_examples) < 3:
                         bad_examples.append((L, round(p.x / K, 6), round(p.y, 6)))
-            elif htree is not None and len(htree.query(p, predicate="within")):
+            elif htree is not None and len(htree.query(p, predicate="dwithin", distance=GS)):
                 c[f"{kind}_onhole"] += 1
             else:
                 c[f"{kind}_bad"] += 1
