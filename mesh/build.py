@@ -25,7 +25,10 @@ Layers (every class the old grid/tile checks use, plus structures):
   hazards     OBSTRN WRECKS UWTROC with VALSOU (areas; lines 3 m; points 20 m discs)
   marks       BOYLAT BOYCAR BOYSPP BOYSAW BOYISD BCNLAT BCNSPP LIGHTS DAYMAR
               PILBOP (+ point MORFAC/OFSPLF/PILPNT): 20 m discs, channel marks flagged
-  clearance   BRIDGE CBLOHD PIPOHD CONVYR (areas; lines as 5 m strips)
+  clearance   BRIDGE CBLOHD PIPOHD CONVYR (areas; lines as 5 m strips), the
+              lowest over a face; an opening bridge (CATBRG 2-5, 7, 8) is
+              flagged and carries its OPEN clearance (VERCOP) or none, never
+              its closed one
   zones       FAIRWY, TSSLPT (ORIENT), TSEZNE, RESARE (RESTRN codes), M_QUAL
               (CATZOC), RECTRC/NAVLNE (lines as 5 m corridors)
 Source priority (GeoJSON input only): each source is cut by the M_COVR
@@ -142,6 +145,33 @@ def num(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+OPENING_BRIDGE = {2, 3, 4, 5, 7, 8}   # CATBRG: opening, swing, lifting, bascule, draw, transporter
+
+
+def is_opening_bridge(pr):
+    """True when the feature's CATBRG (an S-57 list attribute, "4" or
+    "1,9") names a bridge that opens for traffic."""
+    v = pr.get("CATBRG")
+    if v is None:
+        return False
+    codes = str(v).replace("(", "").replace(")", "").split(",")
+    return any(c.strip().isdigit() and int(c) in OPENING_BRIDGE for c in codes)
+
+
+def clearance_of(L, pr):
+    """(clearance, opening) of a BRIDGE/CBLOHD/PIPOHD/CONVYR feature.
+    A fixed span: the first of VERCCL, VERCLR, VERCSA, or None when the
+    chart gives no height (the experiment stored 0.0, which blocked every
+    vessel). An opening bridge: the open clearance VERCOP, or None, and
+    opening=True; its closed clearance is never used, so the router sees
+    the bridge as passable and the flag tells it the span must open."""
+    if L == "BRIDGE" and is_opening_bridge(pr):
+        return num(pr.get("VERCOP")), True
+    v = next((num(pr.get(k)) for k in ("VERCCL", "VERCLR", "VERCSA")
+              if num(pr.get(k)) is not None), None)
+    return v, False
 
 
 def restrn_bits(v):
@@ -524,10 +554,10 @@ def process_tile(args):
         nf = len(faces)
         reps = shapely.point_on_surface(faces)
         A = {k: np.zeros(nf) for k in ("land", "struct", "dredged", "unsurv", "catzoc", "fair",
-                                       "tsez", "resare", "track", "navlne", "haz", "mark", "chanmark", "is_nav")}
+                                       "tsez", "resare", "track", "navlne", "haz", "mark", "chanmark", "is_nav",
+                                       "opening")}
         A["depth"] = np.full(nf, -999.0)
         A["clear"] = np.full(nf, -999.0)
-        A["clear2"] = np.full(nf, -999.0)
         A["tss"] = np.full(nf, -999.0)
         A["hazv"] = np.full(nf, 1e9)
         # depth as the old grid builds it, per source then merged
@@ -574,10 +604,11 @@ def process_tile(args):
                             drg[k_], drg_o[k_] = v, o_
                         A["dredged"][a] = 1
                 elif L in CLEAR:
-                    v = next((num(pr.get(k)) for k in ("VERCCL", "VERCLR", "VERCSA")
-                              if num(pr.get(k)) is not None), 0.0)
-                    c_ = "clear" if L in ("BRIDGE", "CBLOHD") else "clear2"
-                    A[c_][a] = v if A[c_][a] == -999.0 else min(A[c_][a], v)
+                    v, opening = clearance_of(L, pr)
+                    if opening:
+                        A["opening"][a] = 1
+                    if v is not None:
+                        A["clear"][a] = v if A["clear"][a] == -999.0 else min(A["clear"][a], v)
                 elif L == "FAIRWY":
                     A["fair"][a] = 1
                 elif L == "TSSLPT":
@@ -616,8 +647,8 @@ def process_tile(args):
             if a in sq_min:
                 vals.append(sq_min[a])                                 # soundings
             A["depth"][a] = min(vals) if vals else -999.0
-        cols = ["land", "struct", "depth", "dredged", "unsurv", "catzoc", "clear", "clear2", "fair", "tss",
-                "tsez", "resare", "track", "navlne", "haz", "hazv", "mark", "chanmark", "is_nav"]
+        cols = ["land", "struct", "depth", "dredged", "unsurv", "catzoc", "clear", "fair", "tss",
+                "tsez", "resare", "track", "navlne", "haz", "hazv", "mark", "chanmark", "is_nav", "opening"]
         keys = np.column_stack([A[c] for c in cols])
         ukeys, inv = np.unique(keys, axis=0, return_inverse=True)
         inv = inv.ravel()

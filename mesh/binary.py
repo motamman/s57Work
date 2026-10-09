@@ -23,7 +23,8 @@ float64 originLon, float64 originLat, 4 bytes pad), then
   hazv      float32[n]    1e9 = no VALSOU
   rev       int8[n*3]
   flags     uint8[n]      bit0 is_navigable, 1 haz, 2 mark, 3 chanmark,
-                          4 struct, 5 fair, 6 dredged
+                          4 struct, 5 fair, 6 dredged, 7 opening bridge
+                          (clear is then the open clearance, or none)
 """
 import glob
 import json
@@ -88,6 +89,7 @@ def write_binary(src, out, box_, tile_deg, source, log=print):
             | (z["struct"].astype(np.uint8) << 4)
             | (z["fair"].astype(np.uint8) << 5)
             | (z["dredged"].astype(np.uint8) << 6)
+            | (z["opening"].astype(np.uint8) << 7)
         ).astype(np.uint8)
         o = f"{out}/{name}.bin"
         with open(o, "wb") as fh:

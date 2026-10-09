@@ -6,7 +6,7 @@ tile, an UNCOMPRESSED .npz holding everything a route needs, so a route
 only reads: vertex_id, vertices, triangles (local), tri_id, neighbours
 (global ids), rev (index of the shared edge in the neighbour),
 shore_mult, depth_mult, is_navigable, depth, clear (per triangle), and
-the boolean labels haz, mark, chanmark, struct, fair, dredged plus hazv.
+the boolean labels haz, mark, chanmark, struct, fair, dredged, opening plus hazv.
 """
 import glob
 import os
@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-EXTRA = ("haz", "hazv", "mark", "chanmark", "struct", "fair", "dredged")
+EXTRA = ("haz", "hazv", "mark", "chanmark", "struct", "fair", "dredged", "opening")
 
 
 def finalize(src, out, log=print):
@@ -71,7 +71,8 @@ def finalize(src, out, log=print):
                  shore_mult=z["shore_mult"], depth_mult=z["depth_mult"], is_navigable=z["is_navigable"],
                  depth=dep, clear=clr,
                  haz=ex["haz"] > 0, hazv=ex["hazv"], mark=ex["mark"] > 0, chanmark=ex["chanmark"] > 0,
-                 struct=ex["struct"] > 0, fair=ex["fair"] > 0, dredged=ex["dredged"] > 0)
+                 struct=ex["struct"] > 0, fair=ex["fair"] > 0, dredged=ex["dredged"] > 0,
+                 opening=ex["opening"] > 0)
         nbytes += os.path.getsize(o)
     t_write = time.time() - t2
     log(f"finalize: {len(files)} files, {nT:,} triangles; neighbours {t_nb:.1f} s, reverse edges {t_rev:.1f} s, "

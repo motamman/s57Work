@@ -65,7 +65,12 @@ In the output directory (`-o`, default `data/tiles/`):
   float32[n]` (−999 unknown), `clear float32[n]` (−999 none), `hazv
   float32[n]` (1e9 no hazard, −1e9 hazard of unknown depth), `rev
   int8[n*3]`, `flags uint8[n]` (bit 0 navigable, 1 hazard, 2 mark, 3
-  channel mark, 4 structure, 5 fairway, 6 dredged).
+  channel mark, 4 structure, 5 fairway, 6 dredged, 7 opening bridge).
+  Under an opening bridge (CATBRG opening, swing, lifting, bascule,
+  draw, transporter) `clear` is the open clearance (VERCOP) or none,
+  never the closed one; a fixed span with no charted height is none,
+  not 0. The layout and the index version are unchanged: a reader that
+  ignores bit 7 routes through an opening bridge as if it stood open.
 - `<name>_mesh.json` — the sidecar: sources with size and SHA-256, the
   chart's `build_date` when `--chart-json` is given, land polygon date,
   z16 tile and cell counts, each cluster's box, counts, timings, peak
@@ -275,6 +280,19 @@ experiment as it was.
   in no face of either tile, and fail the gate although its disc was
   built and flagged (an obstruction 0.17 m east of a seam at New
   Buffalo, 09CGD).
+- **Opening bridges** (2026-10-08): the experiment stored the first of
+  VERCCL, VERCLR, VERCSA for every bridge, so a bascule, swing or lift
+  bridge was a fixed span at its closed height (Broadway Bridge, lift,
+  7.3 m although it opens to 41.1 m) and a 5 m strip across the channel
+  closed the waterway for any taller mast; a bridge with no clearance
+  attribute became 0 m and blocked every vessel (2,071 of the 2,978
+  District 1 bridges). Now `clearance_of` reads CATBRG: an opening
+  bridge sets flag bit 7 and carries VERCOP or none, a missing height
+  is none. The experiment also sorted overhead pipelines and conveyors
+  (PIPOHD, CONVYR) into a second column, `clear2`, that its finalize
+  never wrote, so they never blocked anything; all four layers now share
+  `clear`, the lowest over a face (District 1: 41 pipelines, 3 with a
+  charted height, one of 8.5 m; 2 conveyors, none with a height).
 - **Not ported**: the experiment's Python routers, grid comparison and
   live-API timing scripts, and the funnel test. Router parity against
   the saved trips is the plugin repository's test.
