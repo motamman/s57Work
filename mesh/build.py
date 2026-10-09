@@ -108,6 +108,7 @@ SRC = {}    # (src, L) -> (polys, props, from_point, STRtree)
 PTS = {}    # (src, L) -> (points, props)   hazard/mark points, for the checks
 SND = {}    # src -> (N, 3) soundings x, y, depth
 COV = {}    # src -> (polys, STRtree)
+COVN = 0    # CATCOV=1 coverage polygons loaded (all sources); COV is freed before the checks
 OSML = None  # (polys, STRtree)
 INV = {}     # layer -> features loaded (all sources)
 REJOIN = {}  # layer -> (tile pieces, features after rejoining)
@@ -183,11 +184,12 @@ def polys(g):
 
 
 def load():
-    global OSML
+    global OSML, COVN
     pad = 0.01
     bb = box(BOX[0] - pad, BOX[1] - pad, BOX[2] + pad, BOX[3] + pad)
     n_feat = 0
     INV.clear()
+    COVN = 0
     for src in PRIORITY:
         for L in LAYERS + ["M_COVR", "SOUNDG"]:
             geoms, props = [], []
@@ -273,6 +275,7 @@ def load():
                 cv = cv[~shapely.is_empty(cv)]
                 if len(cv):
                     COV[src] = (cv, STRtree(cv))
+                    COVN += len(cv)
                 continue
             tid = shapely.get_type_id(arr)
             og, op, od, pg, pp = [], [], [], [], []
@@ -1275,12 +1278,14 @@ def run(workers, log=print):
          f"3x3 region around the densest tile (SW corner {region_lonlat[0]:.2f}, {region_lonlat[1]:.2f}) loaded from files alone "
          f"in {t_region:.2f} s: {len(region_tri):,} triangles, files missing routing arrays {rs}, "
          f"neighbour links leaving the region {int((~inside).sum()):,} of {len(inside):,}"),
-        # Without M_COVR the OSM land polygons override the chart everywhere
-        # (the Great Lakes, the Hudson, every harbour behind the OSM
-        # coastline become land), so its absence gates: an old z16_layers
-        # reused with --reuse-decoded, or a chart whose tiles lack it.
-        ("15 chart coverage loaded", INV.get("M_COVR", 0) > 0,
-         f"M_COVR pieces {INV.get('M_COVR', 0):,}" if INV.get("M_COVR", 0) else "no M_COVR in the decoded input"),
+        # Without usable coverage (M_COVR with CATCOV=1) the OSM land polygons
+        # override the chart everywhere (the Great Lakes, the Hudson, every
+        # harbour behind the OSM coastline become land), so its absence
+        # gates: an old z16_layers reused with --reuse-decoded, or a chart
+        # whose tiles lack it. Counted at load time; COV is freed before here.
+        ("15 chart coverage loaded", COVN > 0,
+         f"M_COVR CATCOV=1 polygons {COVN:,} (M_COVR features {INV.get('M_COVR', 0):,})" if COVN
+         else f"no M_COVR with CATCOV=1 in the decoded input (M_COVR features {INV.get('M_COVR', 0):,})"),
         ("9 medial axis", MEDIAL_STEP * DEG_M <= 10.0 + 1e-9, f"boundary sampled every {MEDIAL_STEP*DEG_M:.0f} m"),
         ("10 hazard data stored", True, "VALSOU (hazv) and CATZOC columns in every tile's attribute table"),
         ("11 time measured", True, f"{t_total:.1f} s end to end"),

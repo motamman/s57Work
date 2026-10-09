@@ -122,7 +122,7 @@ to the sidecar. All of them gate except two:
 | 12 | neighbour links symmetric | yes |
 | 13 | penalties in range | yes |
 | 14 | the 3 × 3 block around the densest tile loads from the files alone | yes |
-| 15 | chart coverage (`M_COVR`) present in the decoded input, also under `--reuse-decoded` | yes |
+| 15 | usable chart coverage (`M_COVR`, `CATCOV` 1) present in the decoded input, also under `--reuse-decoded` | yes |
 | 9, 10, 11 | medial axis step, hazard columns, time measured | yes (always pass) |
 
 Plus two more that gate: the finalize step's reverse-edge check, and

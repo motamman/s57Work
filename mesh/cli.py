@@ -25,8 +25,8 @@ place; --allow-fail turns this into 0); 1 the build itself failed.
 Gating requirements are all of the experiment's checks except "7 angles
 >= 20 deg" and "2 layers loaded", which are reported as warnings, plus
 the finalize reverse-edge check, "15 chart coverage loaded" (M_COVR
-in the decoded input, also when --reuse-decoded reads an old
-z16_layers/) and "no z16 tile failed to decode".
+with CATCOV=1 in the decoded input, also when --reuse-decoded reads an
+old z16_layers/) and "no z16 tile failed to decode".
 """
 import argparse
 import datetime as dt
