@@ -23,20 +23,14 @@ ones that were hard-coded for District 1, and each is listed at the end.
 - The OSM land polygons, `land_polygons.shp` from the
   [osmdata.openstreetmap.de split package](https://osmdata.openstreetmap.de/data/land-polygons.html)
   (`land-polygons-split-4326.zip`, ~700 MB). The data date is read from
-  the package `README.txt` and recorded. Without `--land` only the
-  charts' `LNDARE` is land; the CI always passes it.
-- The GSHHG lakes, `GSHHS_f_L2.shp` from
-  [gshhg-shp-2.3.7.zip](https://www.soest.hawaii.edu/pwessel/gshhg/)
-  (149 MB; the level 3 islands-in-lakes file is read from beside it,
-  the version from the package `README.TXT`). The OSM land polygons are
-  built from coastline only, so the Great Lakes and Lake Champlain are
-  solid land in them and a Great Lakes district meshed to no water at
-  all (09CGD, 2026-10-09). Where a GSHHG lake overlaps the charts' water
-  areas (`DEPARE`, `DRGARE`, `UNSARE`) it is cut out of the OSM land
-  before the land enters the faces, the shore distance and requirement
-  4. The uncharted rest of a lake, every lake the charts do not cover,
-  and rivers (not in GSHHG) stay land. `--lakes` needs `--land`; the CI
-  always passes both.
+  the package `README.txt` and recorded. It applies only outside the
+  charts' coverage (`M_COVR`, CATCOV 1); inside it the chart decides,
+  `LNDARE` is land and what the chart draws as water is water. The OSM
+  polygons are built from coastline only, so the Great Lakes, Lake
+  Champlain, harbours behind a coarse shoreline and every river are land
+  in them; while OSM overrode the chart (to 2026-10-09) 09CGD meshed to
+  no water at all and 01CGD had no Hudson River. Without `--land` only
+  the charts' `LNDARE` is land; the CI always passes it.
 
 ## Stages and files
 
@@ -172,9 +166,8 @@ rebuilds regardless; a named `builds` list restricts the set.
 
 Each district is one matrix job on the runner named by `mesh.runner`
 with `mesh.workers` tile workers: install the packages, restore or
-download the land polygons (cached per calendar month) and the GSHHG
-lake levels (cached by version, SHA-256 checked, the same archive the
-router plugin pins), download the chart from R2, run `build-mesh.py --archive --chart-json`, upload
+download the land polygons (cached per calendar month), download the
+chart from R2, run `build-mesh.py --archive --chart-json`, upload
 `<D>_mesh.tar.zst` and `<D>_mesh.json` as the run artifact. A gating
 failure fails the job and nothing of that district is published.
 
@@ -264,11 +257,14 @@ experiment as it was.
   west and south of the origin unchanged.
 - **MVT extent**: the decoder refuses a layer whose extent is not 4096
   instead of silently mis-scaling it.
-- **Lakes** (2026-10-09): the GSHHG level 2 lakes, minus their level 3
-  islands, are cut out of the OSM land polygons where the charts have
-  water areas (`--lakes`). Without it the Great Lakes are land and 09CGD
-  meshes to nothing. Only charted lake water is cut, so no uncharted
-  lake becomes routable; rivers are untouched.
+- **Chart wins inside its coverage** (2026-10-09): the OSM land polygons
+  are clipped to the outside of the charts' `M_COVR` before they enter
+  the faces, the shore distance and requirement 4; the decoder now reads
+  `M_COVR` from the z16 tiles for that. The experiment let OSM land
+  override charted water, which cost the Great Lakes (09CGD: "no water
+  in the rectangle"), the Hudson and every harbour or river behind the
+  OSM coastline. `check-mesh-land-mask.py` measures the charted water a
+  land mask turns into land, per 0.25° cell.
 - **Not ported**: the experiment's Python routers, grid comparison and
   live-API timing scripts, and the funnel test. Router parity against
   the saved trips is the plugin repository's test.

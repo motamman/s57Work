@@ -7,14 +7,14 @@ Inputs
   pkl        decoded z16 MBTiles layers (mesh.decode)       -- or --
   data       merged S-57 GeoJSON, one directory per source (bands + gap
              fills), with `priority` naming the sources finest first
-  land       OSM land_polygons.shp (the land mask the old grid also used)
-  lakes      GSHHG GSHHS_f_L2.shp (lakes; L3 islands-in-lakes read from the
-             sibling file). The OSM land polygons come from coastline only,
-             so the Great Lakes and Lake Champlain are land in them. Where a
-             GSHHG lake overlaps the chart's water areas (DEPARE, DRGARE,
-             UNSARE) it is cut out of the OSM land; the rest of the lake,
-             and every lake the charts do not cover, stays land. Rivers are
-             not in GSHHG and stay land.
+  land       OSM land_polygons.shp (the land mask the old grid also used),
+             applied only OUTSIDE the charts' coverage (M_COVR, CATCOV=1):
+             inside it the chart decides, LNDARE is land and what the chart
+             draws as water is water. The OSM polygons come from coastline
+             only, so the Great Lakes, Lake Champlain, harbours behind a
+             coarse shoreline and every river are land in them; with OSM
+             overriding the chart, 09CGD meshed to no water at all and
+             01CGD lost the Hudson (2026-10-09).
   out        output directory
 
 Layers (every class the old grid/tile checks use, plus structures):
@@ -100,7 +100,6 @@ LINE_W = {**{L: 3.0 for L in STRUCT}, "OBSTRN": 3.0, "WRECKS": 3.0,
 # measured on it. Its origin is kept verbatim; the arithmetic below is
 # index-relative, so negative offsets west/south of it are fine.
 PG_W, PG_S, PG_RES = -75.5, 38.7, 0.00025
-CHART_WATER = ("DEPARE", "DRGARE", "UNSARE")   # where a GSHHG lake is cut out of the OSM land
 DISC = HAZ | MARKS
 LAYERS = sorted(LAND | STRUCT | DEPTH | HAZ | MARKS | CLEAR | ZONES)
 
@@ -109,20 +108,18 @@ PTS = {}    # (src, L) -> (points, props)   hazard/mark points, for the checks
 SND = {}    # src -> (N, 3) soundings x, y, depth
 COV = {}    # src -> (polys, STRtree)
 OSML = None  # (polys, STRtree)
-LAKES = None  # (polys, STRtree): GSHHG lakes minus their islands, or None
-LAKE = None   # path of GSHHS_f_L2.shp, set by configure()
 INV = {}     # layer -> features loaded (all sources)
 REJOIN = {}  # layer -> (tile pieces, features after rejoining)
 
 
 def configure(box_, out, land=None, pkl=None, data="", tile=0.25, snap=False,
-              debug_points=(), priority=None, lakes=None):
+              debug_points=(), priority=None):
     """Set the build's parameters. `box_` is (west, south, east, north);
     the x scale is cos of its mid-latitude. One of `pkl` (decoded z16
     layers) or `data` (merged GeoJSON per source) must be given."""
-    global BOX, OUT, OSM, PKL, DATA, TILE, K, SNAP, DEBUG_POINTS, PRIORITY, LAKE
+    global BOX, OUT, OSM, PKL, DATA, TILE, K, SNAP, DEBUG_POINTS, PRIORITY
     BOX = tuple(float(v) for v in box_)
-    OUT, OSM, PKL, DATA, TILE, LAKE = out, land, pkl, data, tile, lakes
+    OUT, OSM, PKL, DATA, TILE = out, land, pkl, data, tile
     K = math.cos(math.radians((BOX[1] + BOX[3]) / 2))
     SNAP = bool(snap)
     DEBUG_POINTS = list(debug_points)
@@ -158,6 +155,17 @@ def restrn_bits(v):
     return b
 
 
+def outside_coverage(land_polys, coverage):
+    """The OSM land pieces with the charts' coverage removed: inside
+    M_COVR the chart alone says what is land (LNDARE) and what is water.
+    `coverage` is the union of the coverage polygons in the box, or None."""
+    land_polys = np.asarray(land_polys, dtype=object)
+    if coverage is None or not len(land_polys):
+        return land_polys
+    out = polyonly(shapely.difference(land_polys, coverage))
+    return out[~shapely.is_empty(out)]
+
+
 def polyonly(geoms):
     out = np.empty(len(geoms), dtype=object)
     for k, g in enumerate(geoms):
@@ -174,7 +182,7 @@ def polys(g):
 
 
 def load():
-    global OSML, LAKES
+    global OSML
     pad = 0.01
     bb = box(BOX[0] - pad, BOX[1] - pad, BOX[2] + pad, BOX[3] + pad)
     n_feat = 0
@@ -300,48 +308,7 @@ def load():
     else:
         ga = np.empty(0, dtype=object)
     OSML = (ga, STRtree(ga))
-    # GSHHG lakes (L2) minus islands in lakes (L3), inside the rectangle
-    lk = load_lakes(LAKE, bb) if LAKE else np.empty(0, dtype=object)
-    LAKES = (lk, STRtree(lk)) if len(lk) else None
-    return n_feat, len(ga), len(lk)
-
-
-def load_lakes(l2_shp, bb):
-    """The GSHHG lake polygons (level 2) that intersect `bb`, each with
-    its level 3 islands removed, projected and snapped like the OSM land."""
-    import shapefile
-    l3_shp = os.path.join(os.path.dirname(l2_shp), os.path.basename(l2_shp).replace("_L2", "_L3"))
-    bbox = list(bb.bounds)
-    lakes = [shape(shp.__geo_interface__) for shp in shapefile.Reader(l2_shp).iterShapes(bbox=bbox)]
-    if not lakes:
-        return np.empty(0, dtype=object)
-    islands = []
-    if l3_shp != l2_shp and os.path.exists(l3_shp):
-        islands = [shape(shp.__geo_interface__) for shp in shapefile.Reader(l3_shp).iterShapes(bbox=bbox)]
-    la = np.array(lakes, dtype=object)
-    if islands:
-        isl = shapely.union_all(np.array(islands, dtype=object))
-        la = shapely.difference(la, isl)
-    la = shapely.set_precision(shapely.segmentize(tf(la), DENSIFY), GS)
-    la = np.array([q for g in la for q in polys(g)], dtype=object)
-    return la
-
-
-def lake_water(query_box, water_polys):
-    """The part of the GSHHG lakes inside `query_box` that the chart's
-    water areas `water_polys` cover: the OSM land to cut away. None when
-    there is nothing to cut."""
-    global LAKES
-    if LAKES is None or not water_polys:
-        return None
-    la, ltree = LAKES
-    li = ltree.query(query_box)
-    if not len(li):
-        return None
-    lakes = shapely.union_all(polyonly(shapely.intersection(la[li], query_box)))
-    water = shapely.union_all(np.array(water_polys, dtype=object), grid_size=GS)
-    cut = shapely.intersection(lakes, water, grid_size=GS)
-    return None if cut.is_empty else cut
+    return n_feat, len(ga)
 
 
 TRI_OPTS = ("pq20AQ", "pAQ")
@@ -451,10 +418,7 @@ def process_tile(args):
         oi = otree.query(tbig)
         if len(oi):
             og = polyonly(shapely.intersection(oarr[oi], tbig))
-            cut = lake_water(tbig, [p for L in CHART_WATER for p, _, _ in feats[L]])
-            if cut is not None:
-                og = polyonly(shapely.difference(np.array(og, dtype=object), cut))
-                st["lake_cut_area"] = float(cut.area)
+            og = outside_coverage(og, higher)        # the chart decides inside its coverage
             for gg in og:
                 if not gg.is_empty:
                     feats["OSM"].append((gg, {}, False))
@@ -806,20 +770,7 @@ def process_tile(args):
                 if len(ci):
                     cg3 = shapely.union_all(polyonly(shapely.intersection(carr[ci], tb3)))
                     higher3 = cg3 if higher3 is None else shapely.union(higher3, cg3)
-        osm3 = list(OSML[0][OSML[1].query(tb3)])
-        if osm3 and LAKES is not None:
-            water3 = []
-            for src in PRIORITY:
-                for L in CHART_WATER:
-                    if (src, L) in SRC:
-                        arr, _, _, tree = SRC[(src, L)]
-                        wi = tree.query(tb3)
-                        if len(wi):
-                            water3 += [g for g in polyonly(shapely.intersection(arr[wi], tb3)) if not g.is_empty]
-            cut3 = lake_water(tb3, water3)
-            if cut3 is not None:
-                osm3 = [g for g in polyonly(shapely.difference(np.array(osm3, dtype=object), cut3)) if not g.is_empty]
-        land_g += osm3
+        land_g += [g for g in outside_coverage(OSML[0][OSML[1].query(tb3)], higher3) if not g.is_empty]
         if land_g:
             land_u = shapely.union_all(np.array(land_g, dtype=object))
             shapely.prepare(land_u)
@@ -916,9 +867,9 @@ def run(workers, log=print):
     os.makedirs(OUT, exist_ok=True)
     log(f"box {BOX}  tile {TILE} deg  workers {workers}  K {K:.6f}")
     t0 = time.time()
-    n_feat, n_osm, n_lakes = load()
+    n_feat, n_osm = load()
     t_load = time.time() - t0
-    log(f"load {t_load:.1f} s  features {n_feat:,}  OSM land polygons {n_osm:,}  GSHHG lakes {n_lakes:,}  "
+    log(f"load {t_load:.1f} s  features {n_feat:,}  OSM land polygons {n_osm:,}  "
         f"layer sets {len(SRC)}  point sets {len(PTS)}  sounding sets {len(SND)}  "
         f"rss {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/2**20:.0f} MB")
 
@@ -1293,7 +1244,7 @@ def run(workers, log=print):
         f"plain CDT triangles {tot('tris_a'):,}  medial edges {tot('medial_edges'):,}  mesh files {bytes_out/1e6:.1f} MB")
     log(f"peak RSS main {rss_main:.0f} MB, largest worker {rss_worker:.0f} MB")
 
-    need = sorted(LAND | STRUCT | DEPTH | HAZ | MARKS | CLEAR | ZONES | {"SOUNDG"} | (set() if PKL else {"M_COVR"}))
+    need = sorted(LAND | STRUCT | DEPTH | HAZ | MARKS | CLEAR | ZONES | {"SOUNDG", "M_COVR"})
     missing_layers = [L for L in need if INV.get(L, 0) == 0]
     lc, lm = tot("land_area_chart"), tot("land_area_mesh")
     R = [

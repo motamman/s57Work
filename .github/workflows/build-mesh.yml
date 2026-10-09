@@ -240,31 +240,6 @@ jobs:
           unzip -q land/land-polygons-split-4326.zip -d land
           rm land/land-polygons-split-4326.zip
 
-      # The lake mask: GSHHG 2.3.7 (Wessel & Smith, LGPL), the same archive
-      # and SHA-256 the router plugin pins. Only the full-resolution lake
-      # levels are kept (L2 lakes, L3 islands in lakes) with the README
-      # that names the version; the OSM land polygons above are coastline
-      # only and hold the Great Lakes and Lake Champlain as land.
-      - name: Restore GSHHG lakes
-        id: gshhg
-        uses: actions/cache@v6
-        with:
-          path: gshhg
-          key: gshhg-shp-2.3.7-lakes-f
-
-      - name: Download GSHHG lakes
-        if: steps.gshhg.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p gshhg
-          for url in https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip \
-                     https://router.zeddisplay.com/downloads/gshhg-shp-2.3.7.zip; do
-            if curl -fSL --retry 3 --retry-delay 10 -o gshhg/gshhg-shp-2.3.7.zip "$url"; then break; fi
-          done
-          echo "8dbbe7e071e77e9e75f2d639239099ebca8d5c16d6a07df8169729d49f15cf41  gshhg/gshhg-shp-2.3.7.zip" | sha256sum -c -
-          unzip -q gshhg/gshhg-shp-2.3.7.zip -d gshhg README.TXT LICENSE.TXT \
-            'GSHHS_shp/f/GSHHS_f_L2.*' 'GSHHS_shp/f/GSHHS_f_L3.*'
-          rm gshhg/gshhg-shp-2.3.7.zip
-
       - name: Download the chart
         env:
           R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
@@ -293,12 +268,9 @@ jobs:
         run: |
           shp=$(find land -name land_polygons.shp | head -1)
           if [ -z "$shp" ]; then echo "::error::land_polygons.shp not found under land/"; exit 1; fi
-          lakes=gshhg/GSHHS_shp/f/GSHHS_f_L2.shp
-          if [ ! -f "$lakes" ]; then echo "::error::$lakes not found"; exit 1; fi
           set +e
           python3 build-mesh.py "chart/$STEM.mbtiles" \
             --land "$shp" \
-            --lakes "$lakes" \
             --name "$DISTRICT" \
             --chart-json "chart/$STEM.json" \
             -o out -j "$WORKERS" --archive
