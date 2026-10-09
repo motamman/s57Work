@@ -1,6 +1,6 @@
 """build-mesh.py — build the navigation mesh of one or more chart files.
 
-    build-mesh.py 01CGD_ENCs.mbtiles --land land_polygons.shp [-o data/tiles]
+    build-mesh.py 01CGD_ENCs.mbtiles --land land_polygons.shp --lakes GSHHS_f_L2.shp [-o data/tiles]
 
 Runs the four stages of the experiment in order, with the same
 intermediate files, under the work directory (default data/mesh/<name>/):
@@ -60,6 +60,22 @@ def land_date(shp):
     return m.group(1) if m else None
 
 
+def gshhg_version(shp):
+    """The GSHHG version from the README.TXT beside the shapefile or up to
+    two directories above it (the zip's layout: GSHHS_shp/f/*.shp,
+    README.TXT at the root), or None."""
+    d = os.path.dirname(os.path.abspath(shp))
+    for _ in range(3):
+        for name in ("README.TXT", "README.txt"):
+            readme = os.path.join(d, name)
+            if os.path.exists(readme):
+                m = re.search(r"Version\s+(\d+\.\d+\.\d+)", open(readme, errors="replace").read())
+                if m:
+                    return m.group(1)
+        d = os.path.dirname(d)
+    return None
+
+
 def default_name(first_input):
     stem = os.path.splitext(os.path.basename(first_input))[0]
     return stem[:-5] if stem.endswith("_ENCs") else stem
@@ -92,6 +108,10 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mbtiles", nargs="+", help="chart file(s); several are decoded as separate sources")
     ap.add_argument("--land", help="OSM land_polygons.shp (osmdata.openstreetmap.de split package)")
+    ap.add_argument("--lakes", metavar="GSHHS_f_L2.shp",
+                    help="GSHHG level 2 lakes shapefile (level 3 islands read from the sibling _L3 file); "
+                         "where a lake overlaps the charts' water areas it is cut out of the OSM land "
+                         "(the Great Lakes and Lake Champlain are land in the OSM land polygons)")
     ap.add_argument("-o", "--out", default="data/tiles", help="output directory (default data/tiles)")
     ap.add_argument("--name", help="output name; default: first input's stem without _ENCs (01CGD_ENCs -> 01CGD)")
     ap.add_argument("--work", help="work directory (default data/mesh/<name>)")
@@ -120,6 +140,10 @@ def main(argv=None):
             ap.error(f"no such file: {p}")
     if a.land and not os.path.exists(a.land):
         ap.error(f"no such file: {a.land}")
+    if a.lakes and not os.path.exists(a.lakes):
+        ap.error(f"no such file: {a.lakes}")
+    if a.lakes and not a.land:
+        ap.error("--lakes needs --land: the lakes are cut out of the OSM land polygons")
     name = a.name or default_name(a.mbtiles[0])
     work = a.work or os.path.join("data", "mesh", name)
     os.makedirs(work, exist_ok=True)
@@ -183,7 +207,7 @@ def main(argv=None):
                 shutil.rmtree(d)
         log(f"\nstage 3: build {c.slug} -> {bdir}")
         B.configure(c.box, bdir, land=a.land, pkl=pkl, tile=a.tile_deg, snap=a.snap_discs,
-                    debug_points=debug_points)
+                    debug_points=debug_points, lakes=a.lakes)
         try:
             summ = B.run(a.workers, log=log)
         except B.BuildError as ex:
@@ -243,6 +267,7 @@ def main(argv=None):
         "chart_build_date": build_dates[-1] if build_dates else None,
         "chart_metadata": chart_meta or None,
         "land_polygons": {"file": os.path.basename(a.land), "date": land_date(a.land)} if a.land else None,
+        "lake_polygons": {"file": os.path.basename(a.lakes), "version": gshhg_version(a.lakes)} if a.lakes else None,
         "z16_tiles_decoded": dec["tiles"],
         "z16_cells": len(cells),
         "clusters": results,

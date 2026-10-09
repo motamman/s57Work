@@ -1,6 +1,7 @@
 """End-to-end: build-mesh.py on the tiles of the five-cell fixture
 district (the same chart build as tests/test_pipeline.py), with the
-clipped OSM land polygons in tests/fixtures/land/. Needs GDAL,
+clipped OSM land polygons in tests/fixtures/land/ and the made-up GSHHG
+lakes in tests/fixtures/lakes/. Needs GDAL,
 tippecanoe and the packages in mesh/requirements.txt; skips without.
 
 What is pinned here:
@@ -33,6 +34,7 @@ except ImportError:
     HAVE_MESH_DEPS = False
 
 LAND = h.ROOT / "tests" / "fixtures" / "land" / "land_polygons.shp"
+LAKES = h.ROOT / "tests" / "fixtures" / "lakes" / "GSHHS_f_L2.shp"
 BAND4_BOX = (-71.7, 40.8, -71.4, 41.1)
 HEADER = 32
 PER_TRIANGLE = 6 * 8 + 3 * 4 + 4 + 4 + 4 + 4 + 3 + 1    # corners, neighbours, mult, depth, clear, hazv, rev, flags
@@ -55,7 +57,8 @@ class MeshPipeline(unittest.TestCase):
         cls.meshwork = cls.work / "meshwork"
         cls.proc = subprocess.run(
             [sys.executable, str(h.ROOT / "build-mesh.py"), str(cls.mbtiles),
-             "--land", str(LAND), "-o", str(cls.out), "--name", "MINI", "--work", str(cls.meshwork),
+             "--land", str(LAND), "--lakes", str(LAKES),
+             "-o", str(cls.out), "--name", "MINI", "--work", str(cls.meshwork),
              "-j", "2", "--keep-intermediate", "--archive"],
             cwd=h.ROOT, capture_output=True, text=True)
         side = cls.out / "MINI_mesh.json"
@@ -119,6 +122,7 @@ class MeshPipeline(unittest.TestCase):
         self.assertEqual([x["file"] for x in s["sources"]], ["mini.mbtiles"])
         self.assertEqual(len(s["sources"][0]["sha256"]), 64)
         self.assertEqual(s["land_polygons"]["date"], "2026-06-28T00:00:00Z")
+        self.assertEqual(s["lake_polygons"], {"file": "GSHHS_f_L2.shp", "version": "2.3.7"})
         self.assertGreater(s["z16_tiles_decoded"], 0)
         self.assertIsNone(s["chart_build_date"])          # no --chart-json given
         names = [r["name"] for r in s["clusters"][0]["requirements"]]
