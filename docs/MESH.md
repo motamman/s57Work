@@ -23,8 +23,14 @@ ones that were hard-coded for District 1, and each is listed at the end.
 - The OSM land polygons, `land_polygons.shp` from the
   [osmdata.openstreetmap.de split package](https://osmdata.openstreetmap.de/data/land-polygons.html)
   (`land-polygons-split-4326.zip`, ~700 MB). The data date is read from
-  the package `README.txt` and recorded. Without `--land` only the
-  charts' `LNDARE` is land; the CI always passes it.
+  the package `README.txt` and recorded. It applies only outside the
+  charts' coverage (`M_COVR`, CATCOV 1); inside it the chart decides,
+  `LNDARE` is land and what the chart draws as water is water. The OSM
+  polygons are built from coastline only, so the Great Lakes, Lake
+  Champlain, harbours behind a coarse shoreline and every river are land
+  in them; while OSM overrode the chart (to 2026-10-09) 09CGD meshed to
+  no water at all and 01CGD had no Hudson River. Without `--land` only
+  the charts' `LNDARE` is land; the CI always passes it.
 
 ## Stages and files
 
@@ -116,6 +122,7 @@ to the sidecar. All of them gate except two:
 | 12 | neighbour links symmetric | yes |
 | 13 | penalties in range | yes |
 | 14 | the 3 × 3 block around the densest tile loads from the files alone | yes |
+| 15 | usable chart coverage (`M_COVR`, `CATCOV` 1) present in the decoded input, also under `--reuse-decoded` | yes |
 | 9, 10, 11 | medial axis step, hazard columns, time measured | yes (always pass) |
 
 Plus two more that gate: the finalize step's reverse-edge check, and
@@ -243,7 +250,9 @@ experiment as it was.
 - **Requirement 14**: the route-ready region is the 3 × 3 block around
   the tile with the most triangles instead of a fixed Woods Hole box.
 - **Gating**: the experiment printed the requirements and exited 0;
-  here all but 2 and 7 gate.
+  here all but 2 and 7 gate, and requirement 15 (chart coverage
+  loaded) is new: without `M_COVR` the OSM land overrides the chart
+  everywhere, so a decoded input without it is never published.
 - **Parameters** replace env vars and constants: output and land paths,
   `--snap-discs` (the experiment's `MESH_SNAP`), `--debug-point`
   (`MESH_DEBUG`). The old grid's cell lattice origin (−75.5, 38.7,
@@ -251,6 +260,21 @@ experiment as it was.
   west and south of the origin unchanged.
 - **MVT extent**: the decoder refuses a layer whose extent is not 4096
   instead of silently mis-scaling it.
+- **Chart wins inside its coverage** (2026-10-09): the OSM land polygons
+  are clipped to the outside of the charts' `M_COVR` before they enter
+  the faces, the shore distance and requirement 4; the decoder now reads
+  `M_COVR` from the z16 tiles for that. The experiment let OSM land
+  override charted water, which cost the Great Lakes (09CGD: "no water
+  in the rectangle"), the Hudson and every harbour or river behind the
+  OSM coastline. `check-mesh-land-mask.py` measures the charted water a
+  land mask turns into land, per 0.25° cell.
+- **Requirement 3 within the snap grid** (2026-10-09): a hazard or mark
+  point is looked up in the faces within GS (0.5 m) of it, not by an
+  exact hit. Every input is snapped to that grid, so a point under 0.5 m
+  from a tile edge could sit between the snapped edge and the tile box,
+  in no face of either tile, and fail the gate although its disc was
+  built and flagged (an obstruction 0.17 m east of a seam at New
+  Buffalo, 09CGD).
 - **Not ported**: the experiment's Python routers, grid comparison and
   live-API timing scripts, and the funnel test. Router parity against
   the saved trips is the plugin repository's test.

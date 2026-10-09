@@ -7,7 +7,14 @@ Inputs
   pkl        decoded z16 MBTiles layers (mesh.decode)       -- or --
   data       merged S-57 GeoJSON, one directory per source (bands + gap
              fills), with `priority` naming the sources finest first
-  land       OSM land_polygons.shp (the land mask the old grid also used)
+  land       OSM land_polygons.shp (the land mask the old grid also used),
+             applied only OUTSIDE the charts' coverage (M_COVR, CATCOV=1):
+             inside it the chart decides, LNDARE is land and what the chart
+             draws as water is water. The OSM polygons come from coastline
+             only, so the Great Lakes, Lake Champlain, harbours behind a
+             coarse shoreline and every river are land in them; with OSM
+             overriding the chart, 09CGD meshed to no water at all and
+             01CGD lost the Hudson (2026-10-09).
   out        output directory
 
 Layers (every class the old grid/tile checks use, plus structures):
@@ -30,7 +37,8 @@ Per 0.25 deg tile (processed with a 100 m overlap, then cropped):
   dissolve, 5a CDT (GEOS), 5b quality (Triangle q20, no boundary Steiner
   points), 6 medial axis (Voronoi of boundary every 50 m), 7 write,
   8 checks (every dangerous hazard point and every mark inside a flagged
-  face or on land/structure; land area vs charted+OSM land).
+  face or on land/structure, tested within the snap grid GS; land area vs
+  charted+OSM land).
 Then seam check + reconcile across neighbouring tiles, one global quality
 refinement, neighbours, split into per-tile mesh files, final checks.
 """
@@ -100,6 +108,7 @@ SRC = {}    # (src, L) -> (polys, props, from_point, STRtree)
 PTS = {}    # (src, L) -> (points, props)   hazard/mark points, for the checks
 SND = {}    # src -> (N, 3) soundings x, y, depth
 COV = {}    # src -> (polys, STRtree)
+COVN = 0    # CATCOV=1 coverage polygons loaded (all sources); COV is freed before the checks
 OSML = None  # (polys, STRtree)
 INV = {}     # layer -> features loaded (all sources)
 REJOIN = {}  # layer -> (tile pieces, features after rejoining)
@@ -148,6 +157,17 @@ def restrn_bits(v):
     return b
 
 
+def outside_coverage(land_polys, coverage):
+    """The OSM land pieces with the charts' coverage removed: inside
+    M_COVR the chart alone says what is land (LNDARE) and what is water.
+    `coverage` is the union of the coverage polygons in the box, or None."""
+    land_polys = np.asarray(land_polys, dtype=object)
+    if coverage is None or not len(land_polys):
+        return land_polys
+    out = polyonly(shapely.difference(land_polys, coverage))
+    return out[~shapely.is_empty(out)]
+
+
 def polyonly(geoms):
     out = np.empty(len(geoms), dtype=object)
     for k, g in enumerate(geoms):
@@ -164,11 +184,12 @@ def polys(g):
 
 
 def load():
-    global OSML
+    global OSML, COVN
     pad = 0.01
     bb = box(BOX[0] - pad, BOX[1] - pad, BOX[2] + pad, BOX[3] + pad)
     n_feat = 0
     INV.clear()
+    COVN = 0
     for src in PRIORITY:
         for L in LAYERS + ["M_COVR", "SOUNDG"]:
             geoms, props = [], []
@@ -254,6 +275,7 @@ def load():
                 cv = cv[~shapely.is_empty(cv)]
                 if len(cv):
                     COV[src] = (cv, STRtree(cv))
+                    COVN += len(cv)
                 continue
             tid = shapely.get_type_id(arr)
             og, op, od, pg, pp = [], [], [], [], []
@@ -399,7 +421,9 @@ def process_tile(args):
         oarr, otree = OSML
         oi = otree.query(tbig)
         if len(oi):
-            for gg in polyonly(shapely.intersection(oarr[oi], tbig)):
+            og = polyonly(shapely.intersection(oarr[oi], tbig))
+            og = outside_coverage(og, higher)        # the chart decides inside its coverage
+            for gg in og:
                 if not gg.is_empty:
                     feats["OSM"].append((gg, {}, False))
         snd = np.vstack(snd) if snd else np.empty((0, 3))
@@ -750,7 +774,7 @@ def process_tile(args):
                 if len(ci):
                     cg3 = shapely.union_all(polyonly(shapely.intersection(carr[ci], tb3)))
                     higher3 = cg3 if higher3 is None else shapely.union(higher3, cg3)
-        land_g += list(OSML[0][OSML[1].query(tb3)])
+        land_g += [g for g in outside_coverage(OSML[0][OSML[1].query(tb3)], higher3) if not g.is_empty]
         if land_g:
             land_u = shapely.union_all(np.array(land_g, dtype=object))
             shapely.prepare(land_u)
@@ -798,7 +822,10 @@ def process_tile(args):
             if kind == "haz" and v is not None and v >= MIN_DEPTH_CHECK:
                 continue
             c[f"{kind}_checked"] += 1
-            hit = ptree.query(p, predicate="intersects") if ptree is not None else []
+            # within the snap grid, not an exact hit: a point under 0.5 m from a
+            # tile edge can fall between the snapped edge and the tile box, in no
+            # face of either tile (New Buffalo, 0.17 m east of a seam, 2026-10-09)
+            hit = ptree.query(p, predicate="dwithin", distance=GS) if ptree is not None else []
             if len(hit):
                 ci_ = cols.index("haz" if kind == "haz" else "mark")
                 flag = all(ukeys[part_key[h]][ci_] for h in hit)
@@ -808,7 +835,7 @@ def process_tile(args):
                     c[f"{kind}_bad"] += 1
                     if len(bad_examples) < 3:
                         bad_examples.append((L, round(p.x / K, 6), round(p.y, 6)))
-            elif htree is not None and len(htree.query(p, predicate="within")):
+            elif htree is not None and len(htree.query(p, predicate="dwithin", distance=GS)):
                 c[f"{kind}_onhole"] += 1
             else:
                 c[f"{kind}_bad"] += 1
@@ -1224,7 +1251,7 @@ def run(workers, log=print):
         f"plain CDT triangles {tot('tris_a'):,}  medial edges {tot('medial_edges'):,}  mesh files {bytes_out/1e6:.1f} MB")
     log(f"peak RSS main {rss_main:.0f} MB, largest worker {rss_worker:.0f} MB")
 
-    need = sorted(LAND | STRUCT | DEPTH | HAZ | MARKS | CLEAR | ZONES | {"SOUNDG"} | (set() if PKL else {"M_COVR"}))
+    need = sorted(LAND | STRUCT | DEPTH | HAZ | MARKS | CLEAR | ZONES | {"SOUNDG", "M_COVR"})
     missing_layers = [L for L in need if INV.get(L, 0) == 0]
     lc, lm = tot("land_area_chart"), tot("land_area_mesh")
     R = [
@@ -1251,6 +1278,14 @@ def run(workers, log=print):
          f"3x3 region around the densest tile (SW corner {region_lonlat[0]:.2f}, {region_lonlat[1]:.2f}) loaded from files alone "
          f"in {t_region:.2f} s: {len(region_tri):,} triangles, files missing routing arrays {rs}, "
          f"neighbour links leaving the region {int((~inside).sum()):,} of {len(inside):,}"),
+        # Without usable coverage (M_COVR with CATCOV=1) the OSM land polygons
+        # override the chart everywhere (the Great Lakes, the Hudson, every
+        # harbour behind the OSM coastline become land), so its absence
+        # gates: an old z16_layers reused with --reuse-decoded, or a chart
+        # whose tiles lack it. Counted at load time; COV is freed before here.
+        ("15 chart coverage loaded", COVN > 0,
+         f"M_COVR CATCOV=1 polygons {COVN:,} (M_COVR features {INV.get('M_COVR', 0):,})" if COVN
+         else f"no M_COVR with CATCOV=1 in the decoded input (M_COVR features {INV.get('M_COVR', 0):,})"),
         ("9 medial axis", MEDIAL_STEP * DEG_M <= 10.0 + 1e-9, f"boundary sampled every {MEDIAL_STEP*DEG_M:.0f} m"),
         ("10 hazard data stored", True, "VALSOU (hazv) and CATZOC columns in every tile's attribute table"),
         ("11 time measured", True, f"{t_total:.1f} s end to end"),

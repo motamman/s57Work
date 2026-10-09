@@ -125,10 +125,15 @@ class MeshPipeline(unittest.TestCase):
         self.assertIn("1 tiles built", names)
         self.assertIn("14 route-ready from files", names)
         # The fixture cells lie south of Block Island: no LNDARE at z16, so
-        # land comes from the OSM fixture alone; depth and soundings are charted.
+        # land comes from the OSM fixture alone, outside the cells' M_COVR;
+        # depth and soundings are charted.
         self.assertIn("DEPARE", s["clusters"][0]["layers"])
+        self.assertIn("M_COVR", s["clusters"][0]["layers"])
         self.assertIn("SOUNDG", s["clusters"][0]["layers"])
         self.assertIn("2 layers loaded", [w["name"] for w in s["warnings"]])
+        req = {r["name"]: r for r in s["clusters"][0]["requirements"]}
+        self.assertTrue(req["15 chart coverage loaded"]["pass"], req["15 chart coverage loaded"]["detail"])
+        self.assertTrue(s["passed"], s["gating_failures"])
 
     def test_archive_and_intermediates(self):
         arc = self.out / "MINI_mesh.tar.zst"
