@@ -184,10 +184,14 @@ def main(argv=None):
             if os.path.isdir(d):
                 shutil.rmtree(d)
         log(f"\nstage 3: build {c.slug} -> {bdir}")
-        B.configure(c.box, bdir, land=a.land, pkl=pkl, tile=a.tile_deg, snap=a.snap_discs,
-                    debug_points=debug_points)
+        config = dict(box_=c.box, out=bdir, land=a.land, pkl=pkl, tile=a.tile_deg, snap=a.snap_discs,
+                      debug_points=debug_points)
         try:
-            summ = B.run(a.workers, log=log)
+            # Two fresh interpreters: the tile stage, then the global
+            # refinement, so the refinement (the memory peak) does not
+            # inherit the tile stage's heap. Their output goes to stdout and
+            # to the same build.log as this process.
+            summ = B.run_fresh(config, a.workers, log_path=os.path.join(work, "build.log"))
         except B.BuildError as ex:
             log(f"ERROR: {ex}")
             return 1

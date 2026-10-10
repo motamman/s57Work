@@ -898,10 +898,40 @@ class BuildError(RuntimeError):
     pass
 
 
+RSS_UNIT = 2**20 if sys.platform == "darwin" else 1024   # ru_maxrss: bytes on macOS, kB on Linux
+
+
+def _rss_mb(who=resource.RUSAGE_SELF):
+    return resource.getrusage(who).ru_maxrss / RSS_UNIT
+
+
+def _jsonable(o):
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"not JSON serialisable: {type(o).__name__}")
+
+
 def run(workers, log=print):
-    """Build the mesh for the configured rectangle into OUT. Returns the
-    summary dict (also written to OUT/summary.json). Raises BuildError if
-    the global triangulation fails."""
+    """Build the mesh for the configured rectangle into OUT, both stages in
+    this process. Returns the summary dict (also written to
+    OUT/summary.json). Raises BuildError if the global triangulation fails.
+
+    The CLI runs the two stages in separate fresh interpreters instead
+    (run_fresh): the tile stage leaves several GB of chart data and
+    allocator residue in its process, and the global refinement, the
+    memory peak of the build, must not inherit it (a 16 GB runner lost
+    01CGD there, 2026-10-09). The handoff is on disk: the tile files plus
+    OUT/tiles.json."""
+    run_tiles(workers, log=log)
+    return run_global(workers, log=log)
+
+
+def run_tiles(workers, log=print):
+    """Stage 3a: load the chart data and build every tile of the rectangle
+    into OUT/tile_*.npz. The per-tile results the global stage and the
+    summary need go to OUT/tiles.json. Returns that dict."""
     os.makedirs(OUT, exist_ok=True)
     log(f"box {BOX}  tile {TILE} deg  workers {workers}  K {K:.6f}")
     t0 = time.time()
@@ -909,7 +939,7 @@ def run(workers, log=print):
     t_load = time.time() - t0
     log(f"load {t_load:.1f} s  features {n_feat:,}  OSM land polygons {n_osm:,}  "
         f"layer sets {len(SRC)}  point sets {len(PTS)}  sounding sets {len(SND)}  "
-        f"rss {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/2**20:.0f} MB")
+        f"rss {_rss_mb():.0f} MB")
 
     tiles = []
     nx = math.ceil((BOX[2] - BOX[0]) / TILE)
@@ -930,6 +960,32 @@ def run(workers, log=print):
                 f"{'ok' if st['ok'] else 'FAIL ' + st.get('error', '')} "
                 f"{sum(st['T'].values()):.1f}s cdt={st.get('tris_a', '-')}")
     t_tiles = time.time() - t1
+    handoff = {"results": results, "t_load": t_load, "t_tiles": t_tiles, "workers": workers,
+               "n_feat": n_feat, "n_osm": n_osm, "inv": dict(INV), "rejoin": {k: list(v) for k, v in REJOIN.items()},
+               "covn": int(COVN),
+               "rss_mb": {"tiles_main": _rss_mb(), "tiles_worker": _rss_mb(resource.RUSAGE_CHILDREN)}}
+    with open(f"{OUT}/tiles.json", "w") as f:
+        json.dump(handoff, f, default=_jsonable)
+    log(f"tiles stage done: {len(results)} tiles in {t_tiles:.0f} s, peak RSS main {handoff['rss_mb']['tiles_main']:.0f} MB, "
+        f"largest worker {handoff['rss_mb']['tiles_worker']:.0f} MB; handoff in {OUT}/tiles.json")
+    return handoff
+
+
+def run_global(workers, log=print, handoff=None):
+    """Stage 3b: seam check and weld, the global quality refinement,
+    neighbours, split into per-tile mesh files, checks. Reads the tile
+    files and OUT/tiles.json written by run_tiles (or takes its dict).
+    Returns the summary dict, also written to OUT/summary.json."""
+    if handoff is None:
+        with open(f"{OUT}/tiles.json") as f:
+            handoff = json.load(f)
+    results = handoff["results"]
+    t_load, t_tiles = handoff["t_load"], handoff["t_tiles"]
+    INV.clear(); INV.update(handoff["inv"])
+    REJOIN.clear(); REJOIN.update({k: tuple(v) for k, v in handoff["rejoin"].items()})
+    global COVN
+    COVN = int(handoff.get("covn", COVN))        # requirement 15 counts coverage at load time
+    t0 = time.time() - t_load - t_tiles          # so t_total spans both stages
 
     # ---- seam consistency of the tiles' noded input (PSLG): identical seam
     # vertex sets wherever both sides have water
@@ -1048,6 +1104,7 @@ def run(workers, log=print):
     two = np.flatnonzero(scount == 2)
     o1, o2 = order_[starts[two]], order_[starts[two] + 1]
     same_label[two] = np.all(LAB[o1] == LAB[o2], axis=1)
+    del LAB, LABs, Vs, Ss, allV, ginv, order_, starts, o1, o2    # not needed past here; the refinement is the memory peak
     p_, q_ = gV[gS[:, 0]], gV[gS[:, 1]]
     on_vx = (p_[:, 0] == q_[:, 0]) & np.isin(p_[:, 0], list(seamX))
     on_hy = (p_[:, 1] == q_[:, 1]) & np.isin(p_[:, 1], list(seamY))
@@ -1259,9 +1316,11 @@ def run(workers, log=print):
         for k, v in r["T"].items():
             stages[k] = stages.get(k, 0.0) + v
     tot = lambda key: sum(r.get(key, 0) for r in ok)
-    rss_unit = 2**20 if sys.platform == "darwin" else 1024   # ru_maxrss: bytes on macOS, kB on Linux
-    rss_main = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / rss_unit
-    rss_worker = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / rss_unit
+    rss = dict(handoff.get("rss_mb", {}))
+    rss["global_main"] = _rss_mb()
+    rss["refine_child"] = _rss_mb(resource.RUSAGE_CHILDREN)     # the Triangle fork
+    rss_main = max(rss.get("tiles_main", 0.0), rss["global_main"])
+    rss_worker = max(rss.get("tiles_worker", 0.0), rss["refine_child"])
     log("\n==== summary")
     log(f"load (single process)       {t_load:9.1f} s")
     log(f"tiles wall ({workers} workers)      {t_tiles:9.1f} s")
@@ -1280,7 +1339,8 @@ def run(workers, log=print):
         log("z16 tile pieces rejoined per feature: " + ", ".join(f"{k} {a:,}->{b:,}" for k, (a, b) in sorted(REJOIN.items())))
     log(f"triangles {len(T):,}  vertices {len(V):,}  water parts {tot('water_parts'):,}  "
         f"plain CDT triangles {tot('tris_a'):,}  medial edges {tot('medial_edges'):,}  mesh files {bytes_out/1e6:.1f} MB")
-    log(f"peak RSS main {rss_main:.0f} MB, largest worker {rss_worker:.0f} MB")
+    log(f"peak RSS: tiles stage main {rss.get('tiles_main', 0):.0f} MB, largest tile worker {rss.get('tiles_worker', 0):.0f} MB; "
+        f"global stage main {rss['global_main']:.0f} MB, refinement child {rss['refine_child']:.0f} MB")
 
     need = sorted(LAND | STRUCT | DEPTH | HAZ | MARKS | CLEAR | ZONES | {"SOUNDG", "M_COVR"})
     missing_layers = [L for L in need if INV.get(L, 0) == 0]
@@ -1355,10 +1415,59 @@ def run(workers, log=print):
         "water_parts": int(tot("water_parts")), "medial_edges": int(tot("medial_edges")),
         "layers": dict(sorted(INV.items())),
         "rejoined": {k: list(v) for k, v in REJOIN.items()},
-        "peak_rss_mb": {"main": rss_main, "largest_worker": rss_worker},
+        "peak_rss_mb": {"main": rss_main, "largest_worker": rss_worker, **rss},
         "requirements": [(a, bool(b), c) for a, b, c in R],
         "not_covered_examples": bad_h[:10],
     }
     with open(f"{OUT}/summary.json", "w") as f:
         json.dump(summary, f)
     return summary
+
+
+# ---- the two stages in fresh interpreters (what the CLI uses)
+
+def _stage_entry(stage, config, workers, log_path):
+    """Target of a spawned interpreter: configure, run one stage, log to
+    stdout and to log_path. A BuildError is written to OUT/error.txt and
+    exits 1 so the parent can raise it."""
+    configure(**config)
+
+    def log(msg=""):
+        print(msg, flush=True)
+        if log_path:
+            with open(log_path, "a") as f:
+                f.write(msg + "\n")
+    try:
+        if stage == "tiles":
+            run_tiles(workers, log=log)
+        else:
+            run_global(workers, log=log)
+    except BuildError as ex:
+        with open(f"{config['out']}/error.txt", "w") as f:
+            f.write(str(ex))
+        sys.exit(1)
+
+
+def run_fresh(config, workers, log_path=None):
+    """Run stage 3a and then 3b, each in a freshly spawned interpreter, so
+    the global refinement starts with an empty heap (see run). `config`
+    is the keyword dict for configure(). Returns the summary dict read
+    from OUT/summary.json. Raises BuildError when a stage fails."""
+    import multiprocessing
+    out = config["out"]
+    os.makedirs(out, exist_ok=True)
+    err = f"{out}/error.txt"
+    if os.path.exists(err):
+        os.remove(err)
+    ctx = multiprocessing.get_context("spawn")
+    for stage in ("tiles", "global"):
+        p = ctx.Process(target=_stage_entry, args=(stage, config, workers, log_path), name=f"mesh-{stage}")
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            if os.path.exists(err):
+                raise BuildError(open(err).read())
+            raise BuildError(f"stage {stage} exited with {p.exitcode}"
+                             + (" (killed by signal; out of memory?)" if p.exitcode and p.exitcode < 0 else ""))
+    with open(f"{out}/summary.json") as f:
+        return json.load(f)

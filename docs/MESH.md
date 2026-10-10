@@ -40,7 +40,8 @@ Under the work directory (`data/mesh/<name>/`, `--work`):
 |---|---|---|
 | 1 decode | `mesh/decode.py` | `z16_layers/<LAYER>.pkl`: per layer, a list of (WKB, properties) pieces clipped to their z16 tile, with `__src` and `__ord` |
 | 2 extent | `mesh/extent.py` | nothing; the rectangle(s) to mesh, see below |
-| 3 build | `mesh/build.py` | `build/tile_III_JJJ.npz` (faces, labels, PSLG, medial axis, shore grid), `build/mesh_III_JJJ.npz` (triangles after the global refinement, neighbours, penalties), `build/parts.npz`, `build/summary.json`, `build/progress_<pid>.log` |
+| 3a tiles | `mesh/build.py` `run_tiles` | `build/tile_III_JJJ.npz` (faces, labels, PSLG, medial axis, shore grid), `build/tiles.json` (per-tile results, timings, seam vertices, layer counts: the handoff to 3b), `build/progress_<pid>.log` |
+| 3b global | `mesh/build.py` `run_global` | `build/mesh_III_JJJ.npz` (triangles after the global refinement, neighbours, penalties), `build/parts.npz`, `build/summary.json` |
 | 4a finalize | `mesh/finalize.py` | `final/mesh_III_JJJ.npz`: uncompressed route-ready tiles with reverse edges and per-triangle labels |
 | 4b binary | `mesh/binary.py` | `<out>/<name>_mesh/mesh_III_JJJ.bin` + `index.json` |
 
@@ -52,6 +53,16 @@ PSLG for the global step, medial axis, shore distance; then across
 tiles: seam weld, one global Triangle `q20` refinement, neighbours,
 split back into tile files, checks. The experiment's write-up of why
 each step is there is in the module docstrings.
+
+The CLI runs 3a and 3b in two freshly spawned interpreters
+(`run_fresh`). The tile stage leaves several GB of chart data and
+allocator residue in its process, and the global refinement is the
+memory peak of the build: on 2026-10-09 a 16 GB runner killed 01CGD
+there twice (9.28 M PSLG vertices) while the parent still held 6 to 7 GB
+it no longer needed. With the boundary the refinement starts from an
+empty heap and the label table is freed before Triangle runs. The
+outputs are byte-identical to the single-process `run()`, which stays
+for tests and direct use; `tiles.json` is the only new file.
 
 In the output directory (`-o`, default `data/tiles/`):
 
