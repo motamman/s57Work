@@ -898,6 +898,51 @@ class BuildError(RuntimeError):
     pass
 
 
+def split_segments_through_vertices(tp, moved):
+    """After the seam weld moved the vertices `moved` (indices into
+    tp["U"]), a segment ending at one of them may now pass through another
+    vertex of the tile: a T-junction, which Triangle's quality refinement
+    does not survive (01CGD, 2026-10-10: one weld in New York Harbor put a
+    vertex exactly on a segment and the global refinement never finished;
+    the same block refined in 7 s without the weld). Split every such
+    segment at the vertices on it, keeping its part label. Returns the
+    number of splits."""
+    if not moved:
+        return 0
+    U, S_ = tp["U"], tp["S"]
+    mv = np.fromiter(moved, dtype=np.int64)
+    inc = np.flatnonzero(np.isin(S_[:, 0], mv) | np.isin(S_[:, 1], mv))
+    if not len(inc):
+        return 0
+    segs = shapely.linestrings(U[S_[inc]])
+    hits = STRtree(shapely.points(U)).query(segs, predicate="dwithin", distance=0.9 * GS)
+    n_split = 0
+    new_S, new_SP = [], []
+    for k in np.unique(hits[0]):
+        sidx = inc[k]
+        a_, b_ = S_[sidx]
+        vs = [int(v) for v in hits[1][hits[0] == k] if v != a_ and v != b_]
+        if not vs:
+            continue
+        d = U[b_] - U[a_]
+        L2 = float(d @ d)
+        # strictly interior, measured along the segment
+        tv = [(float((U[v] - U[a_]) @ d) / L2, v) for v in vs]
+        tv = [(t, v) for t, v in tv if 0.0 < t < 1.0
+              and np.hypot(*(U[v] - U[a_])) > 0.5 * GS and np.hypot(*(U[v] - U[b_])) > 0.5 * GS]
+        if not tv:
+            continue
+        chain = [a_] + [v for _, v in sorted(tv)] + [b_]
+        S_[sidx] = [chain[0], chain[1]]
+        for u, v in zip(chain[1:-1], chain[2:]):
+            new_S.append([u, v]); new_SP.append(tp["SP"][sidx])
+        n_split += len(tv)
+    if new_S:
+        tp["S"] = np.vstack([S_, np.array(new_S, dtype=S_.dtype)])
+        tp["SP"] = np.append(tp["SP"], np.array(new_SP, dtype=tp["SP"].dtype))
+    return n_split
+
+
 RSS_UNIT = 2**20 if sys.platform == "darwin" else 1024   # ru_maxrss: bytes on macOS, kB on Linux
 
 
@@ -1038,6 +1083,7 @@ def run_global(workers, log=print, handoff=None):
                 return True
         return False
     welded = split = facing_land = 0
+    moved = {}                      # tile -> vertex indices the weld moved
     for (i, j) in sorted(by):
         for (di, dj, axis, val_of) in ((1, 0, 0, lambda i, j: (BOX[0] + (i + 1) * TILE) * K),
                                        (0, 1, 1, lambda i, j: BOX[1] + (j + 1) * TILE)):
@@ -1059,6 +1105,7 @@ def run_global(workers, log=print, handoff=None):
                         m = int(np.argmin(d))
                         if d[m] <= 2.01 * GS:
                             UX[kx] = UY[iy[m]]; welded += 1
+                            moved.setdefault(X, set()).add(int(kx))
                             continue
             # after welding, split segments at the other side's remaining vertices
             for X, Y in (((i, j), nb), (nb, (i, j))):
@@ -1073,6 +1120,9 @@ def run_global(workers, log=print, handoff=None):
                         split += 1
                     else:
                         facing_land += 1
+    # a moved vertex can put one of its segments exactly through another
+    # vertex of its tile; split those segments there (see the helper)
+    tjunction_split = sum(split_segments_through_vertices(TP[t], moved.get(t, ())) for t in sorted(by))
     Vs, Ss, Rs, Hs, part_tile, part_local, LABs = [], [], [], [], [], [], []
     off = 0
     for t in sorted(by):
@@ -1119,7 +1169,8 @@ def run_global(workers, log=print, handoff=None):
     seam_dropped = int(drop.sum())
     gR = np.vstack(Rs)
     gH = np.vstack(Hs) if Hs else np.empty((0, 2))
-    log(f"seam weld: {welded} vertices welded (<= 2 grid units), {split} segments split, {facing_land} facing land; "
+    log(f"seam weld: {welded} vertices welded (<= 2 grid units), {split} segments split, {facing_land} facing land, "
+        f"{tjunction_split} segments split where a welded vertex's segment passed through a vertex; "
         f"interior seam segments dropped {seam_dropped:,}, kept because the two sides' labels differ {seam_label_kept}, "
         f"single-sided seam segments kept {seam_single}")
     C = (gV.min(0) + gV.max(0)) / 2

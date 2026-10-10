@@ -304,6 +304,22 @@ experiment as it was.
   never wrote, so they never blocked anything; all four layers now share
   `clear`, the lowest over a face (District 1: 41 pipelines, 3 with a
   charted height, one of 8.5 m; 2 conveyors, none with a height).
+- **Seam weld, T-junction split** (2026-10-10): the experiment's weld
+  moves a seam vertex up to two grid steps onto the neighbour's vertex
+  without looking at what the vertex's own segments now pass through.
+  In New York Harbor one such move put a segment exactly through a
+  neighbouring vertex, and Triangle's refinement of the merged domain
+  never terminated: the four harbour squares refined in 7 s without the
+  weld, not in 60 s (16 GB) with it; the whole district was killed at
+  that step on 16 GB and 32 GB runners alike, while every tile refined
+  on its own in 36 s in total. The water that exposed it (the Kills,
+  Newark Bay, the Hudson) only became mesh water with the chart-wins
+  coverage change, which is why earlier builds never hit it. After the
+  weld, `split_segments_through_vertices` splits any segment ending at a
+  moved vertex at the vertices that lie on it (within a grid step),
+  keeping the segment's part; the seam line reports the count. With the
+  fix the 8 × 8 New York block refines to 9.30 M triangles in 64 s at
+  1.8 GB, ratio 1.00 to the per-tile sum (`tests/test_mesh_weld.py`).
 - **Not ported**: the experiment's Python routers, grid comparison and
   live-API timing scripts, and the funnel test. Router parity against
   the saved trips is the plugin repository's test.
