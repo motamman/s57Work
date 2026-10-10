@@ -419,8 +419,12 @@ active:
 # when its chart is newer. 17cgd is left out until asked for: its cells
 # cross the antimeridian (Aleutians), which one rectangle cannot hold.
 mesh:
-  runner: ubuntu-latest   # a larger runner label here if one is available
-  workers: 2              # tile workers; each held up to ~4 GB on District 1
+  # GitHub-hosted larger runner created in the ZedDisplay org (Settings ->
+  # Actions -> Runners): Linux x64, 8 cores, 32 GB, label = its name. The
+  # standard 16 GB runner cannot hold 01CGD's global refinement (killed at
+  # that step three times, 2026-10-09/10). Billed per minute, ~$0.022.
+  runner: mesh-8-core
+  workers: 4              # tile workers; each held up to ~4 GB on District 1
   active:
     - 01cgd
     - 05cgd
